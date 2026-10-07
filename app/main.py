@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.6.7")
+app = FastAPI(title="AKGATE Dashboard", version="0.7.0")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -74,6 +74,7 @@ def notes_db():
     os.makedirs(os.path.dirname(NOTES_DB), exist_ok=True)
     db = sqlite3.connect(NOTES_DB)
     db.execute("CREATE TABLE IF NOT EXISTS notes (ip TEXT PRIMARY KEY, note TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+    db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     return db
 
 @app.get("/api/notes")
@@ -92,6 +93,27 @@ def save_note(ip: str, payload: dict = Body(...)):
             db.execute("DELETE FROM notes WHERE ip=?", (ip,))
         db.commit()
     return {"ip": ip, "note": note}
+
+@app.get("/api/settings")
+def get_settings():
+    defaults = {"wan_download_mbps":"500","wan_upload_mbps":"500","warn_percent":"85","client_warn_percent":"90","active_bps":"1000"}
+    with notes_db() as db:
+        defaults.update({k:v for k,v in db.execute("SELECT key,value FROM settings")})
+    defaults["wan_interface"] = os.getenv("MIKROTIK_WAN_INTERFACE", "ether1")
+    defaults["customer_networks"] = ",".join(str(n) for n in CUSTOMER_NETWORKS)
+    return defaults
+
+@app.put("/api/settings")
+def save_settings(payload: dict = Body(...)):
+    allowed={"wan_download_mbps","wan_upload_mbps","warn_percent","client_warn_percent","active_bps"}
+    with notes_db() as db:
+        for k in allowed:
+            if k in payload:
+                try: v=str(max(0,float(payload[k])))
+                except (ValueError,TypeError): raise HTTPException(status_code=400,detail=f"Neplatná hodnota {k}")
+                db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(k,v))
+        db.commit()
+    return get_settings()
 
 @app.get("/health")
 def health():
