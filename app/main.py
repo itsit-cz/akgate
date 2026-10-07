@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.6.4")
+app = FastAPI(title="AKGATE Dashboard", version="0.6.5")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -355,7 +355,11 @@ def queue_live():
             "available": True,
             "download_bps": int(iface.get("rx-bits-per-second", 0) or 0),
             "upload_bps": int(iface.get("tx-bits-per-second", 0) or 0),
-            "interface": wan_name, "queue_data": live_queues, "t": int(time.time())
+            "interface": wan_name,
+            "rx_pps": int(iface.get("rx-packets-per-second", 0) or 0),
+            "tx_pps": int(iface.get("tx-packets-per-second", 0) or 0),
+            "tx_drops_pps": int(iface.get("tx-queue-drops-per-second", 0) or 0),
+            "queue_data": live_queues, "t": int(time.time())
         }
     except Exception as exc:
         try:
