@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.4.0")
+app = FastAPI(title="AKGATE Dashboard", version="0.5.0")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -131,6 +131,61 @@ def top_customers(minutes: int=Query(5,ge=1,le=21600), limit:int=Query(20,ge=1,l
     return [{"ip":ip,"download_bps":int(d*8/sec),"upload_bps":int(u*8/sec),
              "download_bytes":int(d),"upload_bytes":int(u),"flows_per_second":round(f/sec,2)}
             for ip,d,u,f in rows]
+
+
+@app.get("/api/statistics")
+def statistics(range: str = Query("1h")):
+    minutes, bucket = range_values(range)
+    ch = client()
+    df, sf = customer_filter("DstAddr"), customer_filter("SrcAddr")
+    series = ch.query(f"""
+    SELECT
+      toUnixTimestamp(toStartOfInterval(TimeReceived, INTERVAL {bucket} SECOND)) t,
+      sumIf(Bytes*SamplingRate, InIfBoundary='external' AND OutIfBoundary='internal')*8/{bucket} down,
+      sumIf(Bytes*SamplingRate, InIfBoundary='internal' AND OutIfBoundary='external')*8/{bucket} up,
+      count()/{bucket} fps
+    FROM flows
+    WHERE TimeReceived >= now()-INTERVAL {minutes} MINUTE
+    GROUP BY t ORDER BY t
+    """).result_rows
+    down_values = [float(r[1]) for r in series]
+    up_values = [float(r[2]) for r in series]
+    flow_values = [float(r[3]) for r in series]
+    totals = ch.query(f"""
+    SELECT
+      sumIf(Bytes*SamplingRate, InIfBoundary='external' AND OutIfBoundary='internal'),
+      sumIf(Bytes*SamplingRate, InIfBoundary='internal' AND OutIfBoundary='external')
+    FROM flows WHERE TimeReceived >= now()-INTERVAL {minutes} MINUTE
+    """).result_rows[0]
+    top = ch.query(f"""
+    WITH down AS (
+      SELECT {v4("DstAddr")} ip, sum(Bytes*SamplingRate) bytes, count() flows
+      FROM flows WHERE TimeReceived>=now()-INTERVAL {minutes} MINUTE
+      AND InIfBoundary='external' AND OutIfBoundary='internal' AND {df} GROUP BY ip),
+    up AS (
+      SELECT {v4("SrcAddr")} ip, sum(Bytes*SamplingRate) bytes, count() flows
+      FROM flows WHERE TimeReceived>=now()-INTERVAL {minutes} MINUTE
+      AND InIfBoundary='internal' AND OutIfBoundary='external' AND {sf} GROUP BY ip)
+    SELECT coalesce(down.ip,up.ip) ip, ifNull(down.bytes,0) db, ifNull(up.bytes,0) ub,
+           ifNull(down.flows,0)+ifNull(up.flows,0) fc
+    FROM down FULL OUTER JOIN up ON down.ip=up.ip
+    ORDER BY db+ub DESC LIMIT 100
+    """).result_rows
+    sec = minutes * 60
+    def mmav(values):
+        return {"min": int(min(values) if values else 0),
+                "avg": int(sum(values)/len(values) if values else 0),
+                "max": int(max(values) if values else 0)}
+    return {
+      "range": range, "download_bytes": int(totals[0]), "upload_bytes": int(totals[1]),
+      "download_bps": mmav(down_values), "upload_bps": mmav(up_values),
+      "flows_per_second": mmav(flow_values),
+      "series": [{"t":int(t),"down":int(d),"up":int(u),"flows":round(float(fp),2)} for t,d,u,fp in series],
+      "top": [{"ip":ip,"download_bytes":int(d),"upload_bytes":int(u),
+               "download_bps":int(d*8/sec),"upload_bps":int(u*8/sec),
+               "flows_per_second":round(fc/sec,2)} for ip,d,u,fc in top]
+    }
+
 
 @app.get("/api/customer/{ip}/history")
 def customer_history(ip:str, range:str=Query("1h")):
