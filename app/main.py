@@ -132,7 +132,14 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px;bor
 <div class="panel"><div style="display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap"><div><h2 style="margin:0">Live provoz</h2><div class="muted">10sekundový klouzavý průměr · 60 posledních bodů</div></div><div class="legend"><span class="down"><b>●</b> Download</span><span class="up"><b>●</b> Upload</span></div></div><div id="chart" class="chart"></div></div>
 <div class="panel" style="margin-top:14px"><h2>Top zákazníci · posledních 5 minut</h2><table><thead><tr><th>IP</th><th>Download</th><th>Upload</th><th>Data</th></tr></thead><tbody id="top"></tbody></table></div>
 <script>
-const $=id=>document.getElementById(id), down=$('down'),up=$('up'),flows=$('flows'),data=$('data'),top=$('top'),chart=$('chart'),liveState=$('liveState');
+const byId=id=>document.getElementById(id);
+const downEl=byId('down');
+const upEl=byId('up');
+const flowsEl=byId('flows');
+const dataEl=byId('data');
+const topEl=byId('top');
+const chartEl=byId('chart');
+const liveStateEl=byId('liveState');
 const points=[]; let liveBusy=false,topBusy=false,summaryBusy=false;
 const rate=n=>{const u=['b/s','Kb/s','Mb/s','Gb/s'];let i=0;while(n>=1000&&i<u.length-1){n/=1000;i++}return n.toFixed(n>=100?0:n>=10?1:2)+' '+u[i]}
 const bytes=n=>{const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1000&&i<u.length-1){n/=1000;i++}return n.toFixed(n>=100?0:n>=10?1:2)+' '+u[i]}
@@ -140,15 +147,15 @@ function draw(){
  if(!points.length)return;
  const w=1000,h=240,p=18,max=Math.max(1,...points.flatMap(x=>[x.d,x.u]));
  const path=k=>points.map((x,i)=>{const px=p+(i/Math.max(1,points.length-1))*(w-2*p),py=h-p-(x[k]/max)*(h-2*p);return (i?'L':'M')+px.toFixed(1)+' '+py.toFixed(1)}).join(' ');
- chart.innerHTML='<svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none"><line class="grid" x1="'+p+'" y1="'+(h/2)+'" x2="'+(w-p)+'" y2="'+(h/2)+'"/><line class="grid" x1="'+p+'" y1="'+(h-p)+'" x2="'+(w-p)+'" y2="'+(h-p)+'"/><path class="downline" d="'+path('d')+'"/><path class="upline" d="'+path('u')+'"/></svg>';
+ chartEl.innerHTML='<svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none"><line class="grid" x1="'+p+'" y1="'+(h/2)+'" x2="'+(w-p)+'" y2="'+(h/2)+'"/><line class="grid" x1="'+p+'" y1="'+(h-p)+'" x2="'+(w-p)+'" y2="'+(h-p)+'"/><path class="downline" d="'+path('d')+'"/><path class="upline" d="'+path('u')+'"/></svg>';
 }
 async function refreshLive(){
  if(liveBusy)return; liveBusy=true;
- try{const r=await fetch('/api/live?seconds=10',{cache:'no-store'});if(!r.ok)throw Error(r.status);const s=await r.json();down.textContent=rate(s.download_bps);up.textContent=rate(s.upload_bps);flows.textContent=s.flows_per_second;points.push({d:s.download_bps,u:s.upload_bps});if(points.length>60)points.shift();draw();liveState.innerHTML='<span class="dot"></span>LIVE · 1 s';}
- catch(e){liveState.textContent='● OFFLINE';}
+ try{const r=await fetch('/api/live?seconds=10',{cache:'no-store'});if(!r.ok)throw Error(r.status);const s=await r.json();downEl.textContent=rate(s.download_bps);upEl.textContent=rate(s.upload_bps);flowsEl.textContent=s.flows_per_second;points.push({d:s.download_bps,u:s.upload_bps});if(points.length>60)points.shift();draw();liveStateEl.innerHTML='<span class="dot"></span>LIVE · 1 s';}
+ catch(e){liveStateEl.textContent='● OFFLINE';}
  finally{liveBusy=false;}
 }
-async function refreshSummary(){if(summaryBusy)return;summaryBusy=true;try{const s=await fetch('/api/summary?minutes=5',{cache:'no-store'}).then(r=>r.json());data.textContent=bytes(s.download_bytes+s.upload_bytes)}finally{summaryBusy=false}}
-async function refreshTop(){if(topBusy)return;topBusy=true;try{const rows=await fetch('/api/top?minutes=5&limit=20',{cache:'no-store'}).then(r=>r.json());top.innerHTML=rows.map(x=>'<tr><td>'+x.ip+'</td><td class="down">'+rate(x.download_bps)+'</td><td class="up">'+rate(x.upload_bps)+'</td><td>'+bytes(x.download_bytes+x.upload_bytes)+'</td></tr>').join('')}finally{topBusy=false}}
+async function refreshSummary(){if(summaryBusy)return;summaryBusy=true;try{const s=await fetch('/api/summary?minutes=5',{cache:'no-store'}).then(r=>r.json());dataEl.textContent=bytes(s.download_bytes+s.upload_bytes)}finally{summaryBusy=false}}
+async function refreshTop(){if(topBusy)return;topBusy=true;try{const rows=await fetch('/api/top?minutes=5&limit=20',{cache:'no-store'}).then(r=>r.json());topEl.innerHTML=rows.map(x=>'<tr><td>'+x.ip+'</td><td class="down">'+rate(x.download_bps)+'</td><td class="up">'+rate(x.upload_bps)+'</td><td>'+bytes(x.download_bytes+x.upload_bytes)+'</td></tr>').join('')}finally{topBusy=false}}
 refreshLive();refreshSummary();refreshTop();setInterval(refreshLive,1000);setInterval(refreshTop,5000);setInterval(refreshSummary,5000);
 </script></body></html>"""
