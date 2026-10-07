@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.7.10")
+app = FastAPI(title="AKGATE Dashboard", version="0.8.0")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -75,6 +75,7 @@ def notes_db():
     db = sqlite3.connect(NOTES_DB)
     db.execute("CREATE TABLE IF NOT EXISTS notes (ip TEXT PRIMARY KEY, note TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
     db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, kind TEXT NOT NULL, message TEXT NOT NULL)")
     return db
 
 @app.get("/api/notes")
@@ -114,6 +115,51 @@ def save_settings(payload: dict = Body(...)):
                 db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(k,v))
         db.commit()
     return get_settings()
+
+@app.get("/api/events")
+def get_events(limit: int = Query(100, ge=1, le=500)):
+    with notes_db() as db:
+        rows = db.execute("SELECT id,ts,kind,message FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [{"id":r[0],"ts":r[1],"kind":r[2],"message":r[3]} for r in rows]
+
+@app.post("/api/events")
+def save_event(payload: dict = Body(...)):
+    kind = str(payload.get("kind","info"))[:20]
+    message = str(payload.get("message","")).strip()[:500]
+    if not message: raise HTTPException(status_code=400, detail="Prázdná událost")
+    with notes_db() as db:
+        cur=db.execute("INSERT INTO events(kind,message) VALUES(?,?)",(kind,message)); db.commit()
+        eid=cur.lastrowid
+    return {"id":eid,"kind":kind,"message":message}
+
+@app.delete("/api/events")
+def clear_events():
+    with notes_db() as db:
+        db.execute("DELETE FROM events"); db.commit()
+    return {"ok":True}
+
+@app.get("/api/diagnostics")
+def diagnostics():
+    ch=client(); now_ts=time.time()
+    out={"clickhouse":{"ok":False},"mikrotik":{"ok":False},"netflow":{"ok":False},"collector":{"ok":False}}
+    try:
+        ch.query("SELECT 1"); out["clickhouse"]={"ok":True}
+        row=ch.query("SELECT max(ts), count() FROM interface_stats WHERE ts>=now()-INTERVAL 5 MINUTE").result_rows[0]
+        age=(now_ts-row[0].timestamp()) if row[0] else None
+        out["collector"]={"ok":age is not None and age<15,"last_sample_age_s":round(age,1) if age is not None else None}
+        q=ch.query("SELECT uniqExact(queue_id) FROM queue_stats WHERE ts>=now()-INTERVAL 2 MINUTE").result_rows[0][0]
+        out["collector"]["queues"]=int(q)
+        fr=ch.query("SELECT max(TimeReceived) FROM flows").result_rows[0][0]
+        fage=(now_ts-fr.timestamp()) if fr else None
+        out["netflow"]={"ok":fage is not None and fage<120,"last_flow_age_s":round(fage,1) if fage is not None else None}
+    except Exception as exc: out["clickhouse"]["error"]=str(exc)
+    try:
+        t=time.monotonic()
+        with ROUTER_LOCK:
+            api=router_api(); ident=api.get_resource("/system/identity").get()
+        out["mikrotik"]={"ok":True,"latency_ms":round((time.monotonic()-t)*1000,1),"identity":ident[0].get("name","") if ident else ""}
+    except Exception as exc: out["mikrotik"]={"ok":False,"error":str(exc)}
+    return out
 
 @app.get("/health")
 def health():
@@ -223,6 +269,18 @@ def statistics(range: str = Query("1h")):
     FROM interface_stats
     WHERE ts >= now()-INTERVAL %(minutes)s MINUTE AND interface = %(iface)s
     """, parameters={"minutes": minutes, "iface": wan_name}).result_rows[0]
+    wan_extra = ch.query("""
+    SELECT
+      quantile(0.95)(rx_bps), quantile(0.99)(rx_bps),
+      quantile(0.95)(tx_bps), quantile(0.99)(tx_bps),
+      countIf(rx_bps >= %(d80)s), countIf(rx_bps >= %(d90)s), countIf(rx_bps >= %(d95)s),
+      countIf(tx_bps >= %(u80)s), countIf(tx_bps >= %(u90)s), countIf(tx_bps >= %(u95)s),
+      count()
+    FROM interface_stats
+    WHERE ts >= now()-INTERVAL %(minutes)s MINUTE AND interface = %(iface)s
+    """, parameters={"minutes":minutes,"iface":wan_name,
+      "d80":float(get_settings()["wan_download_mbps"])*1e6*.80,"d90":float(get_settings()["wan_download_mbps"])*1e6*.90,"d95":float(get_settings()["wan_download_mbps"])*1e6*.95,
+      "u80":float(get_settings()["wan_upload_mbps"])*1e6*.80,"u90":float(get_settings()["wan_upload_mbps"])*1e6*.90,"u95":float(get_settings()["wan_upload_mbps"])*1e6*.95}).result_rows[0]
 
     # NetFlow = offered/requested traffic. Keep a fixed 5s window for comparable MIN/AVG/MAX.
     offered_bucket = 5
@@ -270,6 +328,8 @@ def statistics(range: str = Query("1h")):
       "range": range, "download_bytes": total_down, "upload_bytes": total_up,
       "download_bps": {"min": int(wan_stats[0] or 0), "avg": int(wan_stats[1] or 0), "max": int(wan_stats[2] or 0)},
       "upload_bps": {"min": int(wan_stats[3] or 0), "avg": int(wan_stats[4] or 0), "max": int(wan_stats[5] or 0)},
+      "percentiles": {"download":{"p95":int(wan_extra[0] or 0),"p99":int(wan_extra[1] or 0)},"upload":{"p95":int(wan_extra[2] or 0),"p99":int(wan_extra[3] or 0)}},
+      "utilization": {"samples":int(wan_extra[10] or 0),"download":{"80":int(wan_extra[4] or 0),"90":int(wan_extra[5] or 0),"95":int(wan_extra[6] or 0)},"upload":{"80":int(wan_extra[7] or 0),"90":int(wan_extra[8] or 0),"95":int(wan_extra[9] or 0)}},
       "offered_download_bps": mmav(offered_down_values),
       "offered_upload_bps": mmav(offered_up_values),
       "flows_per_second": mmav(flow_values),
@@ -439,6 +499,22 @@ def queue_live():
             pass
         ROUTER_POOL = ROUTER_API = None
         raise HTTPException(status_code=503, detail=str(exc))
+
+@app.get("/api/traffic/history")
+def traffic_history(range: str = Query("1h")):
+    minutes,bucket=range_values(range); ch=client(); wan=os.getenv("MIKROTIK_WAN_INTERFACE","ether1")
+    actual=ch.query(f"""
+      SELECT toUnixTimestamp(toStartOfInterval(ts, INTERVAL {bucket} SECOND)) t, avg(rx_bps), avg(tx_bps)
+      FROM interface_stats WHERE ts>=now()-INTERVAL {minutes} MINUTE AND interface=%(iface)s GROUP BY t ORDER BY t
+    """,parameters={"iface":wan}).result_rows
+    offered=ch.query(f"""
+      SELECT toUnixTimestamp(toStartOfInterval(TimeReceived, INTERVAL {bucket} SECOND)) t,
+       sumIf(Bytes*SamplingRate,InIfBoundary='external' AND OutIfBoundary='internal')*8/{bucket},
+       sumIf(Bytes*SamplingRate,InIfBoundary='internal' AND OutIfBoundary='external')*8/{bucket}
+      FROM flows WHERE TimeReceived>=now()-INTERVAL {minutes} MINUTE GROUP BY t ORDER BY t
+    """).result_rows
+    om={int(t):(int(d),int(u)) for t,d,u in offered}
+    return [{"t":int(t),"down":int(d),"up":int(u),"offered_down":om.get(int(t),(0,0))[0],"offered_up":om.get(int(t),(0,0))[1]} for t,d,u in actual]
 
 @app.get("/api/interface/history")
 def interface_history(range: str = Query("1h")):
