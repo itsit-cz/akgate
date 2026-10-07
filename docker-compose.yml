@@ -12,6 +12,16 @@ services:
     networks:
       - akvorado
 
+  akgate-collector:
+    build: .
+    container_name: akgate-collector
+    restart: unless-stopped
+    command: ["python", "-m", "app.collector"]
+    env_file:
+      - .env
+    networks:
+      - akvorado
+
 networks:
   akvorado:
     external: true
