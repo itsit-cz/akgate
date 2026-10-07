@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.7.8")
+app = FastAPI(title="AKGATE Dashboard", version="0.7.9")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -123,16 +123,23 @@ def health():
         raise HTTPException(status_code=503, detail=str(exc))
 
 @app.get("/api/live")
-def live(seconds: int = Query(10, ge=5, le=60)):
-    row = client().query(f"""
+def live(seconds: int = Query(30, ge=10, le=120)):
+    # NetFlow is asynchronous/batched. Use the latest completed TimeReceived window
+    # instead of now(), so the rate is not artificially low between exporter batches.
+    row = client().query("""
+    WITH latest AS (SELECT max(TimeReceived) AS t FROM flows)
     SELECT
+      max(TimeReceived),
       sumIf(Bytes * SamplingRate, InIfBoundary = 'external' AND OutIfBoundary = 'internal'),
       sumIf(Bytes * SamplingRate, InIfBoundary = 'internal' AND OutIfBoundary = 'external'),
       count()
-    FROM flows WHERE TimeReceived >= now() - INTERVAL {seconds} SECOND
-    """).result_rows[0]
-    return {"window_seconds": seconds, "download_bps": int(row[0]*8/seconds),
-            "upload_bps": int(row[1]*8/seconds), "flows_per_second": round(row[2]/seconds,1)}
+    FROM flows
+    WHERE TimeReceived > (SELECT t FROM latest) - INTERVAL %(seconds)s SECOND
+      AND TimeReceived <= (SELECT t FROM latest)
+    """, parameters={"seconds": seconds}).result_rows[0]
+    return {"window_seconds": seconds, "sample_time": row[0].isoformat() if row[0] else None,
+            "download_bps": int(row[1]*8/seconds), "upload_bps": int(row[2]*8/seconds),
+            "flows_per_second": round(row[3]/seconds,1)}
 
 @app.get("/api/summary")
 def summary(minutes: int = Query(5, ge=1, le=21600)):
