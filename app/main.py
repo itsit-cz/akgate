@@ -511,10 +511,17 @@ def queue_live():
 @app.get("/api/traffic/history")
 def traffic_history(range: str = Query("1h")):
     minutes,bucket=range_values(range); ch=client(); wan=os.getenv("MIKROTIK_WAN_INTERFACE","ether1")
-    actual=ch.query(f"""
-      SELECT toUnixTimestamp(toStartOfInterval(ts, INTERVAL {bucket} SECOND)) t, avg(rx_bps), avg(tx_bps)
-      FROM interface_stats WHERE ts>=now()-INTERVAL {minutes} MINUTE AND interface=%(iface)s GROUP BY t ORDER BY t
-    """,parameters={"iface":wan}).result_rows
+    if minutes <= 20160:
+        actual=ch.query(f"""
+          SELECT toUnixTimestamp(toStartOfInterval(ts, INTERVAL {bucket} SECOND)) t, avg(rx_bps), avg(tx_bps)
+          FROM interface_stats WHERE ts>=now()-INTERVAL {minutes} MINUTE AND interface=%(iface)s GROUP BY t ORDER BY t
+        """,parameters={"iface":wan}).result_rows
+    else:
+        actual=ch.query(f"""
+          SELECT toUnixTimestamp(toStartOfInterval(minute, INTERVAL {bucket} SECOND)) t,
+                 sum(rx_bps_sum)/greatest(sum(samples),1),sum(tx_bps_sum)/greatest(sum(samples),1)
+          FROM interface_stats_1m WHERE minute>=now()-INTERVAL {minutes} MINUTE AND interface=%(iface)s GROUP BY t ORDER BY t
+        """,parameters={"iface":wan}).result_rows
     offered=ch.query(f"""
       SELECT toUnixTimestamp(toStartOfInterval(TimeReceived, INTERVAL {bucket} SECOND)) t,
        sumIf(Bytes*SamplingRate,InIfBoundary='external' AND OutIfBoundary='internal')*8/{bucket},
