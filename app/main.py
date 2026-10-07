@@ -11,16 +11,16 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.7.0")
+app = FastAPI(title="AKGATE Dashboard", version="0.7.5")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
 ]
 
 RANGES = {
-    "1m": (1, 2), "5m": (5, 5), "15m": (15, 10), "1h": (60, 30), "6h": (360, 180),
-    "24h": (1440, 600), "48h": (2880, 1200), "7d": (10080, 3600),
-    "15d": (21600, 7200), "30d": (43200, 14400), "1y": (525600, 86400),
+    "1m": (1, 5), "5m": (5, 5), "15m": (15, 5), "1h": (60, 5), "6h": (360, 5),
+    "24h": (1440, 5), "48h": (2880, 5), "7d": (10080, 5),
+    "15d": (21600, 5), "30d": (43200, 5), "1y": (525600, 5),
 }
 
 def v4(expr: str) -> str:
