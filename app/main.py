@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.8.1")
+app = FastAPI(title="AKGATE Dashboard", version="0.9.0")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -350,6 +350,67 @@ def statistics(range: str = Query("1h")):
     STATS_CACHE[range] = (now, result)
     return result
 
+
+@app.get("/api/customer/{ip}/profile")
+def customer_profile(ip:str, range:str=Query("24h")):
+    ip=valid_ip(ip); minutes,bucket=range_values(range); ch=client()
+    q=ch.query("""
+      SELECT queue_id,argMax(queue_name,ts),argMax(targets,ts),argMax(download_limit,ts),argMax(upload_limit,ts),
+             argMax(download_bps,ts),argMax(upload_bps,ts),argMax(download_dropped,ts),argMax(upload_dropped,ts)
+      FROM queue_stats WHERE has(targets,%(ip)s) AND ts>=now()-INTERVAL 2 MINUTE GROUP BY queue_id LIMIT 1
+    """,parameters={"ip":ip}).result_rows
+    if not q: raise HTTPException(status_code=404,detail="Queue klienta nenalezena")
+    qid,name,targets,dl,ul,db,ub,dd,ud=q[0]; targets=[str(x) for x in targets]
+    # Actual queue speed is one value for the whole queue; never sum target IPs.
+    if minutes <= 20160:
+        hist=ch.query(f"""
+          SELECT toUnixTimestamp(toStartOfInterval(ts,INTERVAL {bucket} SECOND)),avg(download_bps),avg(upload_bps)
+          FROM queue_stats WHERE queue_id=%(qid)s AND ts>=now()-INTERVAL {minutes} MINUTE GROUP BY 1 ORDER BY 1
+        """,parameters={"qid":qid}).result_rows
+        util=ch.query(f"""
+          SELECT count(),countIf(download_bps>=%(d80)s),countIf(download_bps>=%(d90)s),countIf(download_bps>=%(d95)s),
+                 countIf(upload_bps>=%(u80)s),countIf(upload_bps>=%(u90)s),countIf(upload_bps>=%(u95)s),
+                 quantile(.95)(download_bps),quantile(.95)(upload_bps)
+          FROM queue_stats WHERE queue_id=%(qid)s AND ts>=now()-INTERVAL {minutes} MINUTE
+        """,parameters={"qid":qid,"d80":dl*.8,"d90":dl*.9,"d95":dl*.95,"u80":ul*.8,"u90":ul*.9,"u95":ul*.95}).result_rows[0]
+    else:
+        hist=ch.query(f"""
+          SELECT toUnixTimestamp(toStartOfInterval(minute,INTERVAL {bucket} SECOND)),
+                 sum(download_bps_sum)/greatest(sum(samples),1),sum(upload_bps_sum)/greatest(sum(samples),1)
+          FROM queue_stats_1m WHERE queue_id=%(qid)s AND minute>=now()-INTERVAL {minutes} MINUTE GROUP BY 1 ORDER BY 1
+        """,parameters={"qid":qid}).result_rows
+        util=ch.query(f"""
+          SELECT count(),countIf(download_bps_sum/samples>=%(d80)s),countIf(download_bps_sum/samples>=%(d90)s),countIf(download_bps_sum/samples>=%(d95)s),
+                 countIf(upload_bps_sum/samples>=%(u80)s),countIf(upload_bps_sum/samples>=%(u90)s),countIf(upload_bps_sum/samples>=%(u95)s),
+                 quantile(.95)(download_bps_sum/samples),quantile(.95)(upload_bps_sum/samples)
+          FROM queue_stats_1m WHERE queue_id=%(qid)s AND minute>=now()-INTERVAL {minutes} MINUTE
+        """,parameters={"qid":qid,"d80":dl*.8,"d90":dl*.9,"d95":dl*.95,"u80":ul*.8,"u90":ul*.9,"u95":ul*.95}).result_rows[0]
+    ips=",".join("'"+x.replace("'","") +"'" for x in targets) or "''"
+    offered=ch.query(f"""
+      SELECT toUnixTimestamp(toStartOfInterval(TimeReceived,INTERVAL {bucket} SECOND)),
+       sumIf(Bytes*SamplingRate,InIfBoundary='external' AND OutIfBoundary='internal' AND {v4("DstAddr")} IN ({ips}))*8/{bucket},
+       sumIf(Bytes*SamplingRate,InIfBoundary='internal' AND OutIfBoundary='external' AND {v4("SrcAddr")} IN ({ips}))*8/{bucket}
+      FROM flows WHERE TimeReceived>=now()-INTERVAL {minutes} MINUTE
+       AND ({v4("SrcAddr")} IN ({ips}) OR {v4("DstAddr")} IN ({ips})) GROUP BY 1 ORDER BY 1
+    """).result_rows
+    om={int(t):(int(d),int(u)) for t,d,u in offered}
+    per_ip=ch.query(f"""
+      SELECT ip,sum(db),sum(ub),sum(fc) FROM (
+       SELECT {v4("DstAddr")} ip,sum(Bytes*SamplingRate) db,0 ub,count() fc FROM flows
+        WHERE TimeReceived>=now()-INTERVAL {minutes} MINUTE AND InIfBoundary='external' AND OutIfBoundary='internal' AND {v4("DstAddr")} IN ({ips}) GROUP BY ip
+       UNION ALL
+       SELECT {v4("SrcAddr")} ip,0 db,sum(Bytes*SamplingRate) ub,count() fc FROM flows
+        WHERE TimeReceived>=now()-INTERVAL {minutes} MINUTE AND InIfBoundary='internal' AND OutIfBoundary='external' AND {v4("SrcAddr")} IN ({ips}) GROUP BY ip)
+      GROUP BY ip ORDER BY sum(db)+sum(ub) DESC
+    """).result_rows
+    n=int(util[0] or 0)
+    return {"queue_id":qid,"name":name,"targets":targets,"download_limit":int(dl),"upload_limit":int(ul),
+      "download_bps":int(db),"upload_bps":int(ub),"download_dropped":int(dd),"upload_dropped":int(ud),
+      "p95_download_bps":int(util[7] or 0),"p95_upload_bps":int(util[8] or 0),
+      "utilization":{"samples":n,"download":{"80":int(util[1]),"90":int(util[2]),"95":int(util[3])},
+                     "upload":{"80":int(util[4]),"90":int(util[5]),"95":int(util[6])}},
+      "history":[{"t":int(t),"down":int(d),"up":int(u),"offered_down":om.get(int(t),(0,0))[0],"offered_up":om.get(int(t),(0,0))[1]} for t,d,u in hist],
+      "ips":[{"ip":x,"download_bytes":int(d),"upload_bytes":int(u),"flows":int(fc)} for x,d,u,fc in per_ip]}
 
 @app.get("/api/customer/{ip}/history")
 def customer_history(ip:str, range:str=Query("1h")):
