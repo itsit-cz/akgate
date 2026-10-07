@@ -1,0 +1,133 @@
+import os
+import re
+import signal
+import socket
+import time
+from datetime import datetime, timezone
+
+import routeros_api
+
+from .db import client
+
+INTERVAL = max(2.0, float(os.getenv("MIKROTIK_POLL_INTERVAL", "5")))
+HOST = os.getenv("MIKROTIK_HOST", "")
+PORT = int(os.getenv("MIKROTIK_PORT", "8728"))
+USER = os.getenv("MIKROTIK_USER", "")
+PASSWORD = os.getenv("MIKROTIK_PASSWORD", "")
+RUNNING = True
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS queue_stats (
+    ts DateTime64(3, 'UTC'),
+    queue_id String,
+    queue_name String,
+    targets Array(String),
+    upload_bps UInt64,
+    download_bps UInt64,
+    upload_bytes UInt64,
+    download_bytes UInt64,
+    upload_packets UInt64,
+    download_packets UInt64,
+    upload_dropped UInt64,
+    download_dropped UInt64,
+    upload_limit UInt64,
+    download_limit UInt64,
+    comment String
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(ts)
+ORDER BY (ts, queue_id)
+TTL ts + INTERVAL 400 DAY
+"""
+
+def pair(value):
+    try:
+        a, b = str(value or "0/0").split("/", 1)
+        return int(a), int(b)
+    except (ValueError, TypeError):
+        return 0, 0
+
+def targets(value):
+    out = []
+    for part in str(value or "").split(","):
+        m = re.match(r"\s*([^/\s]+)", part)
+        if m:
+            out.append(m.group(1))
+    return out
+
+def connect():
+    pool = routeros_api.RouterOsApiPool(
+        HOST, username=USER, password=PASSWORD, port=PORT,
+        plaintext_login=True, use_ssl=False,
+    )
+    return pool, pool.get_api()
+
+def collect(api):
+    now = datetime.now(timezone.utc)
+    rows = []
+    for q in api.get_resource("/queue/simple").get():
+        if q.get("disabled") == "true" or q.get("dynamic") == "true":
+            continue
+        ips = targets(q.get("target"))
+        if not ips:
+            continue
+        ubps, dbps = pair(q.get("rate"))
+        ubytes, dbytes = pair(q.get("bytes"))
+        upackets, dpackets = pair(q.get("packets"))
+        udropped, ddropped = pair(q.get("dropped"))
+        ulimit, dlimit = pair(q.get("max-limit"))
+        rows.append([
+            now, str(q.get("id", "")), str(q.get("name", "")), ips,
+            ubps, dbps, ubytes, dbytes, upackets, dpackets,
+            udropped, ddropped, ulimit, dlimit, str(q.get("comment", "")),
+        ])
+    return rows
+
+def stop(*_):
+    global RUNNING
+    RUNNING = False
+
+def main():
+    if not HOST or not USER or not PASSWORD:
+        raise SystemExit("MIKROTIK_HOST, MIKROTIK_USER and MIKROTIK_PASSWORD are required")
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    ch = client()
+    ch.command(SCHEMA)
+    pool = api = None
+    while RUNNING:
+        started = time.monotonic()
+        try:
+            if api is None:
+                pool, api = connect()
+                print(f"RouterOS connected: {HOST}:{PORT}", flush=True)
+            rows = collect(api)
+            if rows:
+                ch.insert(
+                    "queue_stats", rows,
+                    column_names=[
+                        "ts","queue_id","queue_name","targets","upload_bps","download_bps",
+                        "upload_bytes","download_bytes","upload_packets","download_packets",
+                        "upload_dropped","download_dropped","upload_limit","download_limit","comment"
+                    ],
+                )
+            print(f"queue_stats: {len(rows)} queues", flush=True)
+        except (socket.timeout, OSError, routeros_api.exceptions.RouterOsApiError, Exception) as exc:
+            print(f"collector error: {type(exc).__name__}: {exc}", flush=True)
+            try:
+                if pool:
+                    pool.disconnect()
+            except Exception:
+                pass
+            pool = api = None
+            time.sleep(2)
+        elapsed = time.monotonic() - started
+        time.sleep(max(0.2, INTERVAL - elapsed))
+    if pool:
+        try:
+            pool.disconnect()
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    main()
