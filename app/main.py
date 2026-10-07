@@ -18,9 +18,9 @@ CUSTOMER_NETWORKS = [
 ]
 
 RANGES = {
-    "1m": (1, 5), "5m": (5, 5), "15m": (15, 5), "1h": (60, 5), "6h": (360, 5),
-    "24h": (1440, 5), "48h": (2880, 5), "7d": (10080, 5),
-    "15d": (21600, 5), "30d": (43200, 5), "1y": (525600, 5),
+    "1m": (1, 2), "5m": (5, 5), "15m": (15, 10), "1h": (60, 30), "6h": (360, 180),
+    "24h": (1440, 600), "48h": (2880, 1200), "7d": (10080, 3600),
+    "15d": (21600, 7200), "30d": (43200, 14400), "1y": (525600, 86400),
 }
 
 def v4(expr: str) -> str:
@@ -206,6 +206,18 @@ def statistics(range: str = Query("1h")):
     GROUP BY t ORDER BY t
     """).result_rows
 
+    stat_bucket = 5
+    stat_series = ch.query(f"""
+    SELECT
+      sumIf(Bytes*SamplingRate, InIfBoundary='external' AND OutIfBoundary='internal')*8/{stat_bucket} down_bps,
+      sumIf(Bytes*SamplingRate, InIfBoundary='internal' AND OutIfBoundary='external')*8/{stat_bucket} up_bps
+    FROM flows
+    PREWHERE TimeReceived >= now()-INTERVAL {minutes} MINUTE
+    GROUP BY toStartOfInterval(TimeReceived, INTERVAL {stat_bucket} SECOND)
+    """).result_rows
+    stat_down_values = [float(r[0]) for r in stat_series]
+    stat_up_values = [float(r[1]) for r in stat_series]
+
     down_values = [float(r[1])*8/bucket for r in series]
     up_values = [float(r[2])*8/bucket for r in series]
     flow_values = [float(r[3])/bucket for r in series]
@@ -237,7 +249,7 @@ def statistics(range: str = Query("1h")):
 
     result = {
       "range": range, "download_bytes": total_down, "upload_bytes": total_up,
-      "download_bps": mmav(down_values), "upload_bps": mmav(up_values),
+      "download_bps": mmav(stat_down_values), "upload_bps": mmav(stat_up_values),
       "flows_per_second": mmav(flow_values),
       "series": [{"t":int(t),"down":int(d*8/bucket),"up":int(u*8/bucket),"flows":round(float(fc)/bucket,2)}
                  for t,d,u,fc in series],
