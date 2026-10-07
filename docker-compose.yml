@@ -7,6 +7,8 @@ services:
       - .env
     ports:
       - "${DASHBOARD_PORT:-8082}:8082"
+    volumes:
+      - ./data:/data
     networks:
       - akvorado
 
