@@ -26,7 +26,10 @@ CREATE TABLE IF NOT EXISTS interface_stats (
     rx_bps UInt64,
     tx_bps UInt64,
     rx_bytes UInt64,
-    tx_bytes UInt64
+    tx_bytes UInt64,
+    rx_pps UInt64,
+    tx_pps UInt64,
+    tx_drops_pps UInt64
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
@@ -130,6 +133,9 @@ def collect_wan(api):
         int(m.get("tx-bits-per-second", 0) or 0),
         int(iface.get("rx-byte", 0) or 0),
         int(iface.get("tx-byte", 0) or 0),
+        int(m.get("rx-packets-per-second", 0) or 0),
+        int(m.get("tx-packets-per-second", 0) or 0),
+        int(m.get("tx-queue-drops-per-second", 0) or 0),
     ]
 
 def stop(*_):
@@ -144,6 +150,9 @@ def main():
     ch = client()
     ch.command(SCHEMA)
     ch.command(WAN_SCHEMA)
+    ch.command("ALTER TABLE interface_stats ADD COLUMN IF NOT EXISTS rx_pps UInt64 DEFAULT 0")
+    ch.command("ALTER TABLE interface_stats ADD COLUMN IF NOT EXISTS tx_pps UInt64 DEFAULT 0")
+    ch.command("ALTER TABLE interface_stats ADD COLUMN IF NOT EXISTS tx_drops_pps UInt64 DEFAULT 0")
     pool = api = None
     while RUNNING:
         started = time.monotonic()
@@ -162,8 +171,8 @@ def main():
                         "upload_dropped","download_dropped","upload_limit","download_limit","comment"
                     ],
                 )
-            ch.insert("interface_stats", [wan], column_names=["ts","interface","rx_bps","tx_bps","rx_bytes","tx_bytes"])
-            print(f"queue_stats: {len(rows)} queues | {WAN_INTERFACE}: RX {wan[2]} TX {wan[3]} bps", flush=True)
+            ch.insert("interface_stats", [wan], column_names=["ts","interface","rx_bps","tx_bps","rx_bytes","tx_bytes","rx_pps","tx_pps","tx_drops_pps"])
+            print(f"queue_stats: {len(rows)} queues | {WAN_INTERFACE}: RX {wan[2]} TX {wan[3]} bps | PPS RX {wan[6]} TX {wan[7]} | drops {wan[8]}/s", flush=True)
         except Exception as exc:
             print(f"collector error: {type(exc).__name__}: {exc}", flush=True)
             try:
