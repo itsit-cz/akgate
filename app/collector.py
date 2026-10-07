@@ -115,14 +115,19 @@ def collect(api):
 
 def collect_wan(api):
     now = datetime.now(timezone.utc)
-    rows = api.get_resource("/interface").get(name=WAN_INTERFACE)
-    if not rows:
-        raise RuntimeError(f"WAN interface {WAN_INTERFACE} not found")
-    iface = rows[0]
+    # Live bitrate exists only in /interface monitor-traffic, not /interface print.
+    monitor = api.get_resource("/interface").call(
+        "monitor-traffic", {"interface": WAN_INTERFACE, "once": ""}
+    )
+    if not monitor:
+        raise RuntimeError(f"WAN interface {WAN_INTERFACE} monitor returned no data")
+    m = monitor[0]
+    iface_rows = api.get_resource("/interface").get(name=WAN_INTERFACE)
+    iface = iface_rows[0] if iface_rows else {}
     return [
         now, WAN_INTERFACE,
-        int(iface.get("rx-bits-per-second", 0) or 0),
-        int(iface.get("tx-bits-per-second", 0) or 0),
+        int(m.get("rx-bits-per-second", 0) or 0),
+        int(m.get("tx-bits-per-second", 0) or 0),
         int(iface.get("rx-byte", 0) or 0),
         int(iface.get("tx-byte", 0) or 0),
     ]
