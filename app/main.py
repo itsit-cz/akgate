@@ -92,8 +92,10 @@ def top_customers(minutes: int=Query(5,ge=1,le=21600), limit:int=Query(20,ge=1,l
       SELECT {v4("SrcAddr")} ip,sum(Bytes*SamplingRate) bytes,count() flows
       FROM flows WHERE TimeReceived>=now()-INTERVAL {minutes} MINUTE
       AND InIfBoundary='internal' AND OutIfBoundary='external' AND {sf} GROUP BY ip)
-    SELECT coalesce(down.ip,up.ip),ifNull(down.bytes,0),ifNull(up.bytes,0),
-      ifNull(down.flows,0)+ifNull(up.flows,0)
+    SELECT coalesce(down.ip,up.ip) AS ip,
+      ifNull(down.bytes,0) AS down_bytes,
+      ifNull(up.bytes,0) AS up_bytes,
+      ifNull(down.flows,0)+ifNull(up.flows,0) AS flow_count
     FROM down FULL OUTER JOIN up ON down.ip=up.ip
     ORDER BY down_bytes+up_bytes DESC LIMIT {limit}
     """).result_rows
