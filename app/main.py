@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.5.8")
+app = FastAPI(title="AKGATE Dashboard", version="0.6.0")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -256,6 +256,101 @@ def customer_detail(ip:str, range:str=Query("1h")):
       "top_asn":[{"asn":int(a),"bytes":int(b)} for a,b in asns],
       "protocols":[{"proto":int(p),"bytes":int(b),"flows":int(f)} for p,b,f in protos],
       "ports":[{"port":int(p),"bytes":int(b)} for p,b in ports]}
+
+
+def queue_table_ready():
+    try:
+        return client().query("EXISTS TABLE queue_stats").result_rows[0][0] == 1
+    except Exception:
+        return False
+
+@app.get("/api/queues")
+def queues():
+    if not queue_table_ready():
+        return []
+    rows = client().query("""
+    SELECT
+      queue_id,
+      argMax(queue_name, ts) queue_name,
+      argMax(targets, ts) targets,
+      argMax(upload_bps, ts) upload_bps,
+      argMax(download_bps, ts) download_bps,
+      argMax(upload_bytes, ts) upload_bytes,
+      argMax(download_bytes, ts) download_bytes,
+      argMax(upload_packets, ts) upload_packets,
+      argMax(download_packets, ts) download_packets,
+      argMax(upload_dropped, ts) upload_dropped,
+      argMax(download_dropped, ts) download_dropped,
+      argMax(upload_limit, ts) upload_limit,
+      argMax(download_limit, ts) download_limit,
+      argMax(comment, ts) comment,
+      max(ts) last_seen
+    FROM queue_stats
+    WHERE ts >= now() - INTERVAL 2 MINUTE
+    GROUP BY queue_id
+    ORDER BY queue_name
+    """).result_rows
+    return [{
+      "queue_id": qid, "name": name, "targets": targets,
+      "upload_bps": int(ubps), "download_bps": int(dbps),
+      "upload_bytes": int(ubytes), "download_bytes": int(dbytes),
+      "upload_packets": int(upackets), "download_packets": int(dpackets),
+      "upload_dropped": int(udrop), "download_dropped": int(ddrop),
+      "upload_limit": int(ulimit), "download_limit": int(dlimit),
+      "comment": comment, "last_seen": seen.isoformat()
+    } for qid,name,targets,ubps,dbps,ubytes,dbytes,upackets,dpackets,udrop,ddrop,ulimit,dlimit,comment,seen in rows]
+
+@app.get("/api/queue/live")
+def queue_live():
+    if not queue_table_ready():
+        return {"available": False, "download_bps": 0, "upload_bps": 0, "queues": 0}
+    row = client().query("""
+    SELECT sum(download_bps), sum(upload_bps), count()
+    FROM (
+      SELECT queue_id, argMax(download_bps, ts) download_bps, argMax(upload_bps, ts) upload_bps
+      FROM queue_stats WHERE ts >= now() - INTERVAL 30 SECOND GROUP BY queue_id
+    )
+    """).result_rows[0]
+    return {"available": bool(row[2]), "download_bps": int(row[0]), "upload_bps": int(row[1]), "queues": int(row[2])}
+
+@app.get("/api/queue/history")
+def queue_history(range: str = Query("1h")):
+    minutes, bucket = range_values(range)
+    if not queue_table_ready():
+        return []
+    rows = client().query(f"""
+    SELECT t,
+      sum(download_bps)/greatest(uniqExact(ts),1) down,
+      sum(upload_bps)/greatest(uniqExact(ts),1) up
+    FROM (
+      SELECT ts, toUnixTimestamp(toStartOfInterval(ts, INTERVAL {bucket} SECOND)) t,
+             queue_id, download_bps, upload_bps
+      FROM queue_stats
+      WHERE ts >= now() - INTERVAL {minutes} MINUTE
+    )
+    GROUP BY t ORDER BY t
+    """).result_rows
+    return [{"t": int(t), "down": int(d), "up": int(u)} for t,d,u in rows]
+
+@app.get("/api/queue/customer/{ip}/history")
+def queue_customer_history(ip: str, range: str = Query("1h")):
+    ip = valid_ip(ip)
+    minutes, bucket = range_values(range)
+    if not queue_table_ready():
+        return []
+    rows = client().query(f"""
+    SELECT t,
+      sum(download_bps)/greatest(uniqExact(ts),1) down,
+      sum(upload_bps)/greatest(uniqExact(ts),1) up
+    FROM (
+      SELECT ts, toUnixTimestamp(toStartOfInterval(ts, INTERVAL {bucket} SECOND)) t,
+             download_bps, upload_bps
+      FROM queue_stats
+      WHERE ts >= now() - INTERVAL {minutes} MINUTE AND has(targets, %(ip)s)
+    )
+    GROUP BY t ORDER BY t
+    """, parameters={"ip": ip}).result_rows
+    return [{"t": int(t), "down": int(d), "up": int(u)} for t,d,u in rows]
 
 
 @app.get("/static/{filename}")
