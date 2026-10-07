@@ -4,6 +4,7 @@ import signal
 import socket
 import time
 from datetime import datetime, timezone
+from ipaddress import ip_address, ip_network
 
 import routeros_api
 
@@ -15,6 +16,7 @@ PORT = int(os.getenv("MIKROTIK_PORT", "8728"))
 USER = os.getenv("MIKROTIK_USER", "")
 PASSWORD = os.getenv("MIKROTIK_PASSWORD", "")
 RUNNING = True
+CUSTOMER_NETWORKS = [ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS queue_stats (
@@ -71,6 +73,18 @@ def collect(api):
         ips = targets(q.get("target"))
         if not ips:
             continue
+        if CUSTOMER_NETWORKS:
+            customer_ips = []
+            for value in ips:
+                try:
+                    addr = ip_address(value)
+                    if any(addr in net for net in CUSTOMER_NETWORKS):
+                        customer_ips.append(value)
+                except ValueError:
+                    pass
+            if not customer_ips:
+                continue
+            ips = customer_ips
         ubps, dbps = pair(q.get("rate"))
         ubytes, dbytes = pair(q.get("bytes"))
         upackets, dpackets = pair(q.get("packets"))
@@ -112,7 +126,7 @@ def main():
                     ],
                 )
             print(f"queue_stats: {len(rows)} queues", flush=True)
-        except (socket.timeout, OSError, routeros_api.exceptions.RouterOsApiError, Exception) as exc:
+        except Exception as exc:
             print(f"collector error: {type(exc).__name__}: {exc}", flush=True)
             try:
                 if pool:
