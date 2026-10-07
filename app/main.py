@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.7.6")
+app = FastAPI(title="AKGATE Dashboard", version="0.7.7")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -217,6 +217,19 @@ def statistics(range: str = Query("1h")):
     WHERE ts >= now()-INTERVAL %(minutes)s MINUTE AND interface = %(iface)s
     """, parameters={"minutes": minutes, "iface": wan_name}).result_rows[0]
 
+    # NetFlow = offered/requested traffic. Keep a fixed 5s window for comparable MIN/AVG/MAX.
+    offered_bucket = 5
+    offered_series = ch.query(f"""
+    SELECT
+      sumIf(Bytes*SamplingRate, InIfBoundary='external' AND OutIfBoundary='internal')*8/{offered_bucket} down_bps,
+      sumIf(Bytes*SamplingRate, InIfBoundary='internal' AND OutIfBoundary='external')*8/{offered_bucket} up_bps
+    FROM flows
+    PREWHERE TimeReceived >= now()-INTERVAL {minutes} MINUTE
+    GROUP BY toStartOfInterval(TimeReceived, INTERVAL {offered_bucket} SECOND)
+    """).result_rows
+    offered_down_values = [float(r[0]) for r in offered_series]
+    offered_up_values = [float(r[1]) for r in offered_series]
+
     down_values = [float(r[1])*8/bucket for r in series]
     up_values = [float(r[2])*8/bucket for r in series]
     flow_values = [float(r[3])/bucket for r in series]
@@ -248,7 +261,10 @@ def statistics(range: str = Query("1h")):
 
     result = {
       "range": range, "download_bytes": total_down, "upload_bytes": total_up,
-      "download_bps": {"min": int(wan_stats[0] or 0), "avg": int(wan_stats[1] or 0), "max": int(wan_stats[2] or 0)}, "upload_bps": {"min": int(wan_stats[3] or 0), "avg": int(wan_stats[4] or 0), "max": int(wan_stats[5] or 0)},
+      "download_bps": {"min": int(wan_stats[0] or 0), "avg": int(wan_stats[1] or 0), "max": int(wan_stats[2] or 0)},
+      "upload_bps": {"min": int(wan_stats[3] or 0), "avg": int(wan_stats[4] or 0), "max": int(wan_stats[5] or 0)},
+      "offered_download_bps": mmav(offered_down_values),
+      "offered_upload_bps": mmav(offered_up_values),
       "flows_per_second": mmav(flow_values),
       "series": [{"t":int(t),"down":int(d*8/bucket),"up":int(u*8/bucket),"flows":round(float(fc)/bucket,2)}
                  for t,d,u,fc in series],
