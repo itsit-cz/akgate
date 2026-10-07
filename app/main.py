@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.6.1")
+app = FastAPI(title="AKGATE Dashboard", version="0.6.2")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -333,15 +333,30 @@ def queue_live():
         with ROUTER_LOCK:
             queues = router_api().get_resource("/queue/simple").get()
         down = up = count = 0
+        live_queues = []
         for q in queues:
             if q.get("disabled") == "true" or q.get("dynamic") == "true":
                 continue
-            targets = [x.strip() for x in str(q.get("target", "")).split(",") if x.strip()]
-            if not any(is_customer_target(x) for x in targets):
+            raw_targets = [x.strip() for x in str(q.get("target", "")).split(",") if x.strip()]
+            customer_targets = [x.split("/", 1)[0] for x in raw_targets if is_customer_target(x)]
+            if not customer_targets:
                 continue
-            u, d = queue_pair(q.get("rate"))
-            up += u; down += d; count += 1
-        return {"available": True, "download_bps": down, "upload_bps": up, "queues": count}
+            # RouterOS Simple Queue rate is upload/download.
+            upload, download = queue_pair(q.get("rate"))
+            up += upload
+            down += download
+            count += 1
+            live_queues.append({
+                "name": str(q.get("name", "")),
+                "targets": customer_targets,
+                "upload_bps": upload,
+                "download_bps": download,
+            })
+        return {
+            "available": True, "download_bps": down, "upload_bps": up,
+            "queues": count, "queue_data": live_queues,
+            "t": int(time.time())
+        }
     except Exception as exc:
         try:
             if ROUTER_POOL: ROUTER_POOL.disconnect()
