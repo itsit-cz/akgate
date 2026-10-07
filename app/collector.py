@@ -15,8 +15,24 @@ HOST = os.getenv("MIKROTIK_HOST", "")
 PORT = int(os.getenv("MIKROTIK_PORT", "8728"))
 USER = os.getenv("MIKROTIK_USER", "")
 PASSWORD = os.getenv("MIKROTIK_PASSWORD", "")
+WAN_INTERFACE = os.getenv("MIKROTIK_WAN_INTERFACE", "ether1")
 RUNNING = True
 CUSTOMER_NETWORKS = [ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()]
+
+WAN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS interface_stats (
+    ts DateTime64(3, 'UTC'),
+    interface String,
+    rx_bps UInt64,
+    tx_bps UInt64,
+    rx_bytes UInt64,
+    tx_bytes UInt64
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(ts)
+ORDER BY (interface, ts)
+TTL ts + INTERVAL 400 DAY
+"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS queue_stats (
@@ -97,6 +113,20 @@ def collect(api):
         ])
     return rows
 
+def collect_wan(api):
+    now = datetime.now(timezone.utc)
+    rows = api.get_resource("/interface").get(name=WAN_INTERFACE)
+    if not rows:
+        raise RuntimeError(f"WAN interface {WAN_INTERFACE} not found")
+    iface = rows[0]
+    return [
+        now, WAN_INTERFACE,
+        int(iface.get("rx-bits-per-second", 0) or 0),
+        int(iface.get("tx-bits-per-second", 0) or 0),
+        int(iface.get("rx-byte", 0) or 0),
+        int(iface.get("tx-byte", 0) or 0),
+    ]
+
 def stop(*_):
     global RUNNING
     RUNNING = False
@@ -108,6 +138,7 @@ def main():
     signal.signal(signal.SIGINT, stop)
     ch = client()
     ch.command(SCHEMA)
+    ch.command(WAN_SCHEMA)
     pool = api = None
     while RUNNING:
         started = time.monotonic()
@@ -116,6 +147,7 @@ def main():
                 pool, api = connect()
                 print(f"RouterOS connected: {HOST}:{PORT}", flush=True)
             rows = collect(api)
+            wan = collect_wan(api)
             if rows:
                 ch.insert(
                     "queue_stats", rows,
@@ -125,7 +157,8 @@ def main():
                         "upload_dropped","download_dropped","upload_limit","download_limit","comment"
                     ],
                 )
-            print(f"queue_stats: {len(rows)} queues", flush=True)
+            ch.insert("interface_stats", [wan], column_names=["ts","interface","rx_bps","tx_bps","rx_bytes","tx_bytes"])
+            print(f"queue_stats: {len(rows)} queues | {WAN_INTERFACE}: RX {wan[2]} TX {wan[3]} bps", flush=True)
         except Exception as exc:
             print(f"collector error: {type(exc).__name__}: {exc}", flush=True)
             try:
