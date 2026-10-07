@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.6.3")
+app = FastAPI(title="AKGATE Dashboard", version="0.6.4")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -334,10 +334,12 @@ def queue_live():
         with ROUTER_LOCK:
             api = router_api()
             queues = api.get_resource("/queue/simple").get()
-            ifaces = api.get_resource("/interface").get(name=wan_name)
-        if not ifaces:
-            raise RuntimeError(f"WAN interface {wan_name} not found")
-        iface = ifaces[0]
+            monitor = api.get_resource("/interface").call(
+                "monitor-traffic", {"interface": wan_name, "once": ""}
+            )
+        if not monitor:
+            raise RuntimeError(f"WAN interface {wan_name} monitor returned no data")
+        iface = monitor[0]
         live_queues = []
         for q in queues:
             if q.get("disabled") == "true" or q.get("dynamic") == "true":
