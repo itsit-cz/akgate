@@ -2,6 +2,8 @@ from ipaddress import ip_address, ip_network
 import os
 import sqlite3
 import time
+import threading
+import routeros_api
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Body
@@ -9,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.6.0")
+app = FastAPI(title="AKGATE Dashboard", version="0.6.1")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -43,6 +45,30 @@ STATIC_DIR = Path(__file__).parent / "static"
 NOTES_DB = os.getenv("NOTES_DB", "/data/akgate.db")
 STATS_CACHE = {}
 STATS_CACHE_TTL = 30
+ROUTER_LOCK = threading.Lock()
+ROUTER_POOL = None
+ROUTER_API = None
+
+def router_api():
+    global ROUTER_POOL, ROUTER_API
+    if ROUTER_API is None:
+        ROUTER_POOL = routeros_api.RouterOsApiPool(os.getenv("MIKROTIK_HOST", ""), username=os.getenv("MIKROTIK_USER", ""), password=os.getenv("MIKROTIK_PASSWORD", ""), port=int(os.getenv("MIKROTIK_PORT", "8728")), plaintext_login=True, use_ssl=False)
+        ROUTER_API = ROUTER_POOL.get_api()
+    return ROUTER_API
+
+def queue_pair(value):
+    try:
+        a, b = str(value or "0/0").split("/", 1)
+        return int(a), int(b)
+    except (ValueError, TypeError):
+        return 0, 0
+
+def is_customer_target(value):
+    try:
+        addr = ip_address(str(value).split("/", 1)[0])
+        return not CUSTOMER_NETWORKS or any(addr in net for net in CUSTOMER_NETWORKS)
+    except ValueError:
+        return False
 
 def notes_db():
     os.makedirs(os.path.dirname(NOTES_DB), exist_ok=True)
@@ -302,16 +328,27 @@ def queues():
 
 @app.get("/api/queue/live")
 def queue_live():
-    if not queue_table_ready():
-        return {"available": False, "download_bps": 0, "upload_bps": 0, "queues": 0}
-    row = client().query("""
-    SELECT sum(download_bps), sum(upload_bps), count()
-    FROM (
-      SELECT queue_id, argMax(download_bps, ts) download_bps, argMax(upload_bps, ts) upload_bps
-      FROM queue_stats WHERE ts >= now() - INTERVAL 30 SECOND GROUP BY queue_id
-    )
-    """).result_rows[0]
-    return {"available": bool(row[2]), "download_bps": int(row[0]), "upload_bps": int(row[1]), "queues": int(row[2])}
+    global ROUTER_API, ROUTER_POOL
+    try:
+        with ROUTER_LOCK:
+            queues = router_api().get_resource("/queue/simple").get()
+        down = up = count = 0
+        for q in queues:
+            if q.get("disabled") == "true" or q.get("dynamic") == "true":
+                continue
+            targets = [x.strip() for x in str(q.get("target", "")).split(",") if x.strip()]
+            if not any(is_customer_target(x) for x in targets):
+                continue
+            u, d = queue_pair(q.get("rate"))
+            up += u; down += d; count += 1
+        return {"available": True, "download_bps": down, "upload_bps": up, "queues": count}
+    except Exception as exc:
+        try:
+            if ROUTER_POOL: ROUTER_POOL.disconnect()
+        except Exception:
+            pass
+        ROUTER_POOL = ROUTER_API = None
+        raise HTTPException(status_code=503, detail=str(exc))
 
 @app.get("/api/queue/history")
 def queue_history(range: str = Query("1h")):
