@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.7.5")
+app = FastAPI(title="AKGATE Dashboard", version="0.7.6")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -206,17 +206,16 @@ def statistics(range: str = Query("1h")):
     GROUP BY t ORDER BY t
     """).result_rows
 
-    stat_bucket = 5
-    stat_series = ch.query(f"""
+    # Autorita pro skutečnou WAN rychlost je MikroTik ether1.
+    # Akvorado/NetFlow zůstává jen pro flows, klienty, ASN, protokoly a porty.
+    wan_name = os.getenv("MIKROTIK_WAN_INTERFACE", "ether1")
+    wan_stats = ch.query("""
     SELECT
-      sumIf(Bytes*SamplingRate, InIfBoundary='external' AND OutIfBoundary='internal')*8/{stat_bucket} down_bps,
-      sumIf(Bytes*SamplingRate, InIfBoundary='internal' AND OutIfBoundary='external')*8/{stat_bucket} up_bps
-    FROM flows
-    PREWHERE TimeReceived >= now()-INTERVAL {minutes} MINUTE
-    GROUP BY toStartOfInterval(TimeReceived, INTERVAL {stat_bucket} SECOND)
-    """).result_rows
-    stat_down_values = [float(r[0]) for r in stat_series]
-    stat_up_values = [float(r[1]) for r in stat_series]
+      min(rx_bps), avg(rx_bps), max(rx_bps),
+      min(tx_bps), avg(tx_bps), max(tx_bps)
+    FROM interface_stats
+    WHERE ts >= now()-INTERVAL %(minutes)s MINUTE AND interface = %(iface)s
+    """, parameters={"minutes": minutes, "iface": wan_name}).result_rows[0]
 
     down_values = [float(r[1])*8/bucket for r in series]
     up_values = [float(r[2])*8/bucket for r in series]
@@ -249,7 +248,7 @@ def statistics(range: str = Query("1h")):
 
     result = {
       "range": range, "download_bytes": total_down, "upload_bytes": total_up,
-      "download_bps": mmav(stat_down_values), "upload_bps": mmav(stat_up_values),
+      "download_bps": {"min": int(wan_stats[0] or 0), "avg": int(wan_stats[1] or 0), "max": int(wan_stats[2] or 0)}, "upload_bps": {"min": int(wan_stats[3] or 0), "avg": int(wan_stats[4] or 0), "max": int(wan_stats[5] or 0)},
       "flows_per_second": mmav(flow_values),
       "series": [{"t":int(t),"down":int(d*8/bucket),"up":int(u*8/bucket),"flows":round(float(fc)/bucket,2)}
                  for t,d,u,fc in series],
