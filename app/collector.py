@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS interface_stats (
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
 ORDER BY (interface, ts)
-TTL ts + INTERVAL 400 DAY
+TTL ts + INTERVAL 14 DAY
 """
 
 SCHEMA = """
@@ -60,6 +60,37 @@ PARTITION BY toYYYYMM(ts)
 ORDER BY (ts, queue_id)
 TTL ts + INTERVAL 400 DAY
 """
+
+ROLLUP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS interface_stats_1m (
+    minute DateTime('UTC'), interface String,
+    rx_bps_sum UInt64, tx_bps_sum UInt64, rx_pps_sum UInt64, tx_pps_sum UInt64,
+    tx_drops_pps_sum UInt64, samples UInt64
+) ENGINE=SummingMergeTree
+PARTITION BY toYYYYMM(minute) ORDER BY (interface,minute)
+TTL minute + INTERVAL 400 DAY;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS interface_stats_1m_mv TO interface_stats_1m AS
+SELECT toStartOfMinute(ts) minute, interface, sum(rx_bps) rx_bps_sum, sum(tx_bps) tx_bps_sum,
+ sum(rx_pps) rx_pps_sum, sum(tx_pps) tx_pps_sum, sum(tx_drops_pps) tx_drops_pps_sum, count() samples
+FROM interface_stats GROUP BY minute,interface;
+
+CREATE TABLE IF NOT EXISTS queue_stats_1m (
+    minute DateTime('UTC'), queue_id String,
+    download_bps_sum UInt64, upload_bps_sum UInt64, samples UInt64
+) ENGINE=SummingMergeTree
+PARTITION BY toYYYYMM(minute) ORDER BY (queue_id,minute)
+TTL minute + INTERVAL 400 DAY;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS queue_stats_1m_mv TO queue_stats_1m AS
+SELECT toStartOfMinute(ts) minute, queue_id, sum(download_bps) download_bps_sum,
+ sum(upload_bps) upload_bps_sum, count() samples
+FROM queue_stats GROUP BY minute,queue_id;
+"""
+
+def ensure_rollups(ch):
+    for statement in [x.strip() for x in ROLLUP_SCHEMA.split(";") if x.strip()]:
+        ch.command(statement)
 
 def pair(value):
     try:
@@ -150,6 +181,7 @@ def main():
     ch = client()
     ch.command(SCHEMA)
     ch.command(WAN_SCHEMA)
+    ensure_rollups(ch)
     ch.command("ALTER TABLE interface_stats ADD COLUMN IF NOT EXISTS rx_pps UInt64 DEFAULT 0")
     ch.command("ALTER TABLE interface_stats ADD COLUMN IF NOT EXISTS tx_pps UInt64 DEFAULT 0")
     ch.command("ALTER TABLE interface_stats ADD COLUMN IF NOT EXISTS tx_drops_pps UInt64 DEFAULT 0")
