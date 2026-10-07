@@ -1,0 +1,16 @@
+services:
+  akgate-dashboard:
+    build: .
+    container_name: akgate-dashboard
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${DASHBOARD_PORT:-8082}:8082"
+    networks:
+      - akvorado
+
+networks:
+  akvorado:
+    external: true
+    name: ${AKVORADO_NETWORK:-akvorado_default}
