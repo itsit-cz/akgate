@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.6.5")
+app = FastAPI(title="AKGATE Dashboard", version="0.6.7")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -326,20 +326,44 @@ def queues():
       "comment": comment, "last_seen": seen.isoformat()
     } for qid,name,targets,ubps,dbps,ubytes,dbytes,upackets,dpackets,udrop,ddrop,ulimit,dlimit,comment,seen in rows]
 
-@app.get("/api/queue/live")
-def queue_live():
+@app.get("/api/interface/live")
+def interface_live():
     global ROUTER_API, ROUTER_POOL
     try:
         wan_name = os.getenv("MIKROTIK_WAN_INTERFACE", "ether1")
         with ROUTER_LOCK:
             api = router_api()
-            queues = api.get_resource("/queue/simple").get()
             monitor = api.get_resource("/interface").call(
                 "monitor-traffic", {"interface": wan_name, "once": ""}
             )
         if not monitor:
             raise RuntimeError(f"WAN interface {wan_name} monitor returned no data")
         iface = monitor[0]
+        return {
+            "available": True,
+            "download_bps": int(iface.get("rx-bits-per-second", 0) or 0),
+            "upload_bps": int(iface.get("tx-bits-per-second", 0) or 0),
+            "interface": wan_name,
+            "rx_pps": int(iface.get("rx-packets-per-second", 0) or 0),
+            "tx_pps": int(iface.get("tx-packets-per-second", 0) or 0),
+            "tx_drops_pps": int(iface.get("tx-queue-drops-per-second", 0) or 0),
+            "t": int(time.time())
+        }
+    except Exception as exc:
+        try:
+            if ROUTER_POOL: ROUTER_POOL.disconnect()
+        except Exception:
+            pass
+        ROUTER_POOL = ROUTER_API = None
+        raise HTTPException(status_code=503, detail=str(exc))
+
+@app.get("/api/queue/live")
+def queue_live():
+    global ROUTER_API, ROUTER_POOL
+    try:
+        with ROUTER_LOCK:
+            api = router_api()
+            queues = api.get_resource("/queue/simple").get()
         live_queues = []
         for q in queues:
             if q.get("disabled") == "true" or q.get("dynamic") == "true":
@@ -351,16 +375,7 @@ def queue_live():
             upload, download = queue_pair(q.get("rate"))
             live_queues.append({"name": str(q.get("name", "")), "targets": customer_targets,
                                 "upload_bps": upload, "download_bps": download})
-        return {
-            "available": True,
-            "download_bps": int(iface.get("rx-bits-per-second", 0) or 0),
-            "upload_bps": int(iface.get("tx-bits-per-second", 0) or 0),
-            "interface": wan_name,
-            "rx_pps": int(iface.get("rx-packets-per-second", 0) or 0),
-            "tx_pps": int(iface.get("tx-packets-per-second", 0) or 0),
-            "tx_drops_pps": int(iface.get("tx-queue-drops-per-second", 0) or 0),
-            "queue_data": live_queues, "t": int(time.time())
-        }
+        return {"available": True, "queue_data": live_queues, "t": int(time.time())}
     except Exception as exc:
         try:
             if ROUTER_POOL: ROUTER_POOL.disconnect()
