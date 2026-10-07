@@ -262,25 +262,33 @@ def statistics(range: str = Query("1h")):
     # Autorita pro skutečnou WAN rychlost je MikroTik ether1.
     # Akvorado/NetFlow zůstává jen pro flows, klienty, ASN, protokoly a porty.
     wan_name = os.getenv("MIKROTIK_WAN_INTERFACE", "ether1")
-    wan_stats = ch.query("""
-    SELECT
-      min(rx_bps), avg(rx_bps), max(rx_bps),
-      min(tx_bps), avg(tx_bps), max(tx_bps)
-    FROM interface_stats
-    WHERE ts >= now()-INTERVAL %(minutes)s MINUTE AND interface = %(iface)s
-    """, parameters={"minutes": minutes, "iface": wan_name}).result_rows[0]
-    wan_extra = ch.query("""
-    SELECT
-      quantile(0.95)(rx_bps), quantile(0.99)(rx_bps),
-      quantile(0.95)(tx_bps), quantile(0.99)(tx_bps),
-      countIf(rx_bps >= %(d80)s), countIf(rx_bps >= %(d90)s), countIf(rx_bps >= %(d95)s),
-      countIf(tx_bps >= %(u80)s), countIf(tx_bps >= %(u90)s), countIf(tx_bps >= %(u95)s),
-      count()
-    FROM interface_stats
-    WHERE ts >= now()-INTERVAL %(minutes)s MINUTE AND interface = %(iface)s
-    """, parameters={"minutes":minutes,"iface":wan_name,
-      "d80":float(get_settings()["wan_download_mbps"])*1e6*.80,"d90":float(get_settings()["wan_download_mbps"])*1e6*.90,"d95":float(get_settings()["wan_download_mbps"])*1e6*.95,
-      "u80":float(get_settings()["wan_upload_mbps"])*1e6*.80,"u90":float(get_settings()["wan_upload_mbps"])*1e6*.90,"u95":float(get_settings()["wan_upload_mbps"])*1e6*.95}).result_rows[0]
+    cfg=get_settings(); dcap=float(cfg["wan_download_mbps"])*1e6; ucap=float(cfg["wan_upload_mbps"])*1e6
+    if minutes <= 20160:
+        wan_stats = ch.query("""
+        SELECT min(rx_bps),avg(rx_bps),max(rx_bps),min(tx_bps),avg(tx_bps),max(tx_bps),
+               greatest(max(rx_bytes)-min(rx_bytes),0),greatest(max(tx_bytes)-min(tx_bytes),0)
+        FROM interface_stats WHERE ts>=now()-INTERVAL %(minutes)s MINUTE AND interface=%(iface)s
+        """,parameters={"minutes":minutes,"iface":wan_name}).result_rows[0]
+        wan_extra = ch.query("""
+        SELECT quantile(0.95)(rx_bps),quantile(0.99)(rx_bps),quantile(0.95)(tx_bps),quantile(0.99)(tx_bps),
+          countIf(rx_bps>=%(d80)s),countIf(rx_bps>=%(d90)s),countIf(rx_bps>=%(d95)s),
+          countIf(tx_bps>=%(u80)s),countIf(tx_bps>=%(u90)s),countIf(tx_bps>=%(u95)s),count()
+        FROM interface_stats WHERE ts>=now()-INTERVAL %(minutes)s MINUTE AND interface=%(iface)s
+        """,parameters={"minutes":minutes,"iface":wan_name,"d80":dcap*.8,"d90":dcap*.9,"d95":dcap*.95,"u80":ucap*.8,"u90":ucap*.9,"u95":ucap*.95}).result_rows[0]
+    else:
+        wan_stats = ch.query("""
+        SELECT min(rx_bps_sum/samples),avg(rx_bps_sum/samples),max(rx_bps_sum/samples),
+               min(tx_bps_sum/samples),avg(tx_bps_sum/samples),max(tx_bps_sum/samples),
+               sum(rx_bps_sum/samples)*60/8,sum(tx_bps_sum/samples)*60/8
+        FROM interface_stats_1m WHERE minute>=now()-INTERVAL %(minutes)s MINUTE AND interface=%(iface)s
+        """,parameters={"minutes":minutes,"iface":wan_name}).result_rows[0]
+        wan_extra = ch.query("""
+        SELECT quantile(0.95)(rx_bps_sum/samples),quantile(0.99)(rx_bps_sum/samples),
+          quantile(0.95)(tx_bps_sum/samples),quantile(0.99)(tx_bps_sum/samples),
+          countIf(rx_bps_sum/samples>=%(d80)s),countIf(rx_bps_sum/samples>=%(d90)s),countIf(rx_bps_sum/samples>=%(d95)s),
+          countIf(tx_bps_sum/samples>=%(u80)s),countIf(tx_bps_sum/samples>=%(u90)s),countIf(tx_bps_sum/samples>=%(u95)s),count()
+        FROM interface_stats_1m WHERE minute>=now()-INTERVAL %(minutes)s MINUTE AND interface=%(iface)s
+        """,parameters={"minutes":minutes,"iface":wan_name,"d80":dcap*.8,"d90":dcap*.9,"d95":dcap*.95,"u80":ucap*.8,"u90":ucap*.9,"u95":ucap*.95}).result_rows[0]
 
     # NetFlow = offered/requested traffic. Keep a fixed 5s window for comparable MIN/AVG/MAX.
     offered_bucket = 5
@@ -325,7 +333,7 @@ def statistics(range: str = Query("1h")):
                 "max": int(max(values) if values else 0)}
 
     result = {
-      "range": range, "download_bytes": total_down, "upload_bytes": total_up,
+      "range": range, "download_bytes": int(wan_stats[6] or 0), "upload_bytes": int(wan_stats[7] or 0),
       "download_bps": {"min": int(wan_stats[0] or 0), "avg": int(wan_stats[1] or 0), "max": int(wan_stats[2] or 0)},
       "upload_bps": {"min": int(wan_stats[3] or 0), "avg": int(wan_stats[4] or 0), "max": int(wan_stats[5] or 0)},
       "percentiles": {"download":{"p95":int(wan_extra[0] or 0),"p99":int(wan_extra[1] or 0)},"upload":{"p95":int(wan_extra[2] or 0),"p99":int(wan_extra[3] or 0)}},
