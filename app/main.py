@@ -8,14 +8,14 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.5.1")
+app = FastAPI(title="AKGATE Dashboard", version="0.5.2")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
 ]
 
 RANGES = {
-    "5m": (5, 5), "15m": (15, 10), "1h": (60, 30), "6h": (360, 180),
+    "1m": (1, 2), "5m": (5, 5), "15m": (15, 10), "1h": (60, 30), "6h": (360, 180),
     "24h": (1440, 600), "48h": (2880, 1200), "7d": (10080, 3600),
     "15d": (21600, 7200), "30d": (43200, 14400), "1y": (525600, 86400),
 }
