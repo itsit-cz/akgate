@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.6.2")
+app = FastAPI(title="AKGATE Dashboard", version="0.6.3")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -330,9 +330,14 @@ def queues():
 def queue_live():
     global ROUTER_API, ROUTER_POOL
     try:
+        wan_name = os.getenv("MIKROTIK_WAN_INTERFACE", "ether1")
         with ROUTER_LOCK:
-            queues = router_api().get_resource("/queue/simple").get()
-        down = up = count = 0
+            api = router_api()
+            queues = api.get_resource("/queue/simple").get()
+            ifaces = api.get_resource("/interface").get(name=wan_name)
+        if not ifaces:
+            raise RuntimeError(f"WAN interface {wan_name} not found")
+        iface = ifaces[0]
         live_queues = []
         for q in queues:
             if q.get("disabled") == "true" or q.get("dynamic") == "true":
@@ -341,21 +346,14 @@ def queue_live():
             customer_targets = [x.split("/", 1)[0] for x in raw_targets if is_customer_target(x)]
             if not customer_targets:
                 continue
-            # RouterOS Simple Queue rate is upload/download.
             upload, download = queue_pair(q.get("rate"))
-            up += upload
-            down += download
-            count += 1
-            live_queues.append({
-                "name": str(q.get("name", "")),
-                "targets": customer_targets,
-                "upload_bps": upload,
-                "download_bps": download,
-            })
+            live_queues.append({"name": str(q.get("name", "")), "targets": customer_targets,
+                                "upload_bps": upload, "download_bps": download})
         return {
-            "available": True, "download_bps": down, "upload_bps": up,
-            "queues": count, "queue_data": live_queues,
-            "t": int(time.time())
+            "available": True,
+            "download_bps": int(iface.get("rx-bits-per-second", 0) or 0),
+            "upload_bps": int(iface.get("tx-bits-per-second", 0) or 0),
+            "interface": wan_name, "queue_data": live_queues, "t": int(time.time())
         }
     except Exception as exc:
         try:
@@ -364,6 +362,25 @@ def queue_live():
             pass
         ROUTER_POOL = ROUTER_API = None
         raise HTTPException(status_code=503, detail=str(exc))
+
+@app.get("/api/interface/history")
+def interface_history(range: str = Query("1h")):
+    minutes, bucket = range_values(range)
+    wan_name = os.getenv("MIKROTIK_WAN_INTERFACE", "ether1")
+    try:
+        exists = client().query("EXISTS TABLE interface_stats").result_rows[0][0]
+    except Exception:
+        exists = 0
+    if not exists:
+        return []
+    rows = client().query(f"""
+    SELECT toUnixTimestamp(toStartOfInterval(ts, INTERVAL {bucket} SECOND)) t,
+           avg(rx_bps) down, avg(tx_bps) up
+    FROM interface_stats
+    WHERE ts >= now() - INTERVAL {minutes} MINUTE AND interface = %(iface)s
+    GROUP BY t ORDER BY t
+    """, parameters={"iface": wan_name}).result_rows
+    return [{"t": int(t), "down": int(d), "up": int(u)} for t,d,u in rows]
 
 @app.get("/api/queue/history")
 def queue_history(range: str = Query("1h")):
