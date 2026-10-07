@@ -2,6 +2,17 @@
 
 ISP traffic dashboard combining Akvorado/ClickHouse flow analytics with real post-shaping MikroTik Simple Queue traffic.
 
+## v0.8.0
+
+- MikroTik remains the authority for actual WAN/client traffic; Akvorado/NetFlow is secondary demand/analytics
+- actual vs NetFlow demand comparison in the WAN graph
+- WAN P95/P99 and time above 80/90/95% capacity
+- current top-load table with actual traffic, NetFlow demand, limits and drops
+- persistent event history in SQLite
+- diagnostics for MikroTik API, collector, Akvorado/NetFlow and ClickHouse
+- raw MikroTik samples retained 14 days; 1-minute WAN/queue rollups retained 400 days
+- statistics transferred bytes now use MikroTik WAN counters instead of NetFlow totals
+
 ## v0.6.0
 
 - real download/upload from MikroTik Simple Queue
