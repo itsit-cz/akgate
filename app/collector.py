@@ -182,6 +182,8 @@ def main():
     ch.command(SCHEMA)
     ch.command(WAN_SCHEMA)
     ensure_rollups(ch)
+    ch.command("ALTER TABLE interface_stats MODIFY TTL ts + INTERVAL 14 DAY")
+    ch.command("ALTER TABLE queue_stats MODIFY TTL ts + INTERVAL 14 DAY")
     ch.command("ALTER TABLE interface_stats ADD COLUMN IF NOT EXISTS rx_pps UInt64 DEFAULT 0")
     ch.command("ALTER TABLE interface_stats ADD COLUMN IF NOT EXISTS tx_pps UInt64 DEFAULT 0")
     ch.command("ALTER TABLE interface_stats ADD COLUMN IF NOT EXISTS tx_drops_pps UInt64 DEFAULT 0")
