@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.9.0")
+app = FastAPI(title="AKGATE Dashboard", version="0.9.1")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -240,116 +240,86 @@ def top_customers(minutes: int=Query(5,ge=1,le=21600), limit:int=Query(20,ge=1,l
 
 @app.get("/api/statistics")
 def statistics(range: str = Query("1h")):
-    minutes, bucket = range_values(range)
+    minutes, _ = range_values(range)
+    # Statistics resolution: <=1h closes into 1-minute blocks; >=6h into 10-minute blocks.
+    # This keeps the response small and avoids expensive 5-second NetFlow grouping on long ranges.
+    bucket = 60 if minutes <= 60 else 600
     now = time.monotonic()
     cached = STATS_CACHE.get(range)
-    if cached and now - cached[0] < STATS_CACHE_TTL:
+    cache_ttl = 30 if minutes <= 60 else 300
+    if cached and now - cached[0] < cache_ttl:
         return cached[1]
 
-    ch = client()
-    df, sf = customer_filter("DstAddr"), customer_filter("SrcAddr")
-    series = ch.query(f"""
-    SELECT
-      toUnixTimestamp(toStartOfInterval(TimeReceived, INTERVAL {bucket} SECOND)) t,
-      sumIf(Bytes*SamplingRate, InIfBoundary='external' AND OutIfBoundary='internal') down_bytes,
-      sumIf(Bytes*SamplingRate, InIfBoundary='internal' AND OutIfBoundary='external') up_bytes,
-      count() flows
-    FROM flows
-    PREWHERE TimeReceived >= now()-INTERVAL {minutes} MINUTE
-    GROUP BY t ORDER BY t
-    """).result_rows
-
-    # Autorita pro skutečnou WAN rychlost je MikroTik ether1.
-    # Akvorado/NetFlow zůstává jen pro flows, klienty, ASN, protokoly a porty.
-    wan_name = os.getenv("MIKROTIK_WAN_INTERFACE", "ether1")
+    ch=client(); df,sf=customer_filter("DstAddr"),customer_filter("SrcAddr")
+    wan=os.getenv("MIKROTIK_WAN_INTERFACE","ether1")
     cfg=get_settings(); dcap=float(cfg["wan_download_mbps"])*1e6; ucap=float(cfg["wan_upload_mbps"])*1e6
-    if minutes <= 20160:
-        wan_stats = ch.query("""
-        SELECT min(rx_bps),avg(rx_bps),max(rx_bps),min(tx_bps),avg(tx_bps),max(tx_bps),
-               greatest(max(rx_bytes)-min(rx_bytes),0),greatest(max(tx_bytes)-min(tx_bytes),0)
-        FROM interface_stats WHERE ts>=now()-INTERVAL %(minutes)s MINUTE AND interface=%(iface)s
-        """,parameters={"minutes":minutes,"iface":wan_name}).result_rows[0]
-        wan_extra = ch.query("""
-        SELECT quantile(0.95)(rx_bps),quantile(0.99)(rx_bps),quantile(0.95)(tx_bps),quantile(0.99)(tx_bps),
-          countIf(rx_bps>=%(d80)s),countIf(rx_bps>=%(d90)s),countIf(rx_bps>=%(d95)s),
-          countIf(tx_bps>=%(u80)s),countIf(tx_bps>=%(u90)s),countIf(tx_bps>=%(u95)s),count()
-        FROM interface_stats WHERE ts>=now()-INTERVAL %(minutes)s MINUTE AND interface=%(iface)s
-        """,parameters={"minutes":minutes,"iface":wan_name,"d80":dcap*.8,"d90":dcap*.9,"d95":dcap*.95,"u80":ucap*.8,"u90":ucap*.9,"u95":ucap*.95}).result_rows[0]
+
+    # Actual WAN: use 1-minute rollup whenever possible; only the last hour needs raw samples.
+    if minutes <= 60:
+        actual=ch.query(f"""
+          SELECT toUnixTimestamp(toStartOfInterval(ts,INTERVAL {bucket} SECOND)) t,
+                 avg(rx_bps),avg(tx_bps),min(rx_bps),max(rx_bps),min(tx_bps),max(tx_bps),
+                 quantile(.95)(rx_bps),quantile(.99)(rx_bps),quantile(.95)(tx_bps),quantile(.99)(tx_bps),
+                 countIf(rx_bps>=%(d80)s),countIf(rx_bps>=%(d90)s),countIf(rx_bps>=%(d95)s),
+                 countIf(tx_bps>=%(u80)s),countIf(tx_bps>=%(u90)s),countIf(tx_bps>=%(u95)s),count()
+          FROM interface_stats WHERE ts>=now()-INTERVAL {minutes} MINUTE AND interface=%(iface)s
+          GROUP BY t ORDER BY t
+        """,parameters={"iface":wan,"d80":dcap*.8,"d90":dcap*.9,"d95":dcap*.95,"u80":ucap*.8,"u90":ucap*.9,"u95":ucap*.95}).result_rows
+        counters=ch.query("""
+          SELECT greatest(max(rx_bytes)-min(rx_bytes),0),greatest(max(tx_bytes)-min(tx_bytes),0)
+          FROM interface_stats WHERE ts>=now()-INTERVAL %(minutes)s MINUTE AND interface=%(iface)s
+        """,parameters={"minutes":minutes,"iface":wan}).result_rows[0]
     else:
-        wan_stats = ch.query("""
-        SELECT min(rx_bps_sum/samples),avg(rx_bps_sum/samples),max(rx_bps_sum/samples),
-               min(tx_bps_sum/samples),avg(tx_bps_sum/samples),max(tx_bps_sum/samples),
-               sum(rx_bps_sum/samples)*60/8,sum(tx_bps_sum/samples)*60/8
-        FROM interface_stats_1m WHERE minute>=now()-INTERVAL %(minutes)s MINUTE AND interface=%(iface)s
-        """,parameters={"minutes":minutes,"iface":wan_name}).result_rows[0]
-        wan_extra = ch.query("""
-        SELECT quantile(0.95)(rx_bps_sum/samples),quantile(0.99)(rx_bps_sum/samples),
-          quantile(0.95)(tx_bps_sum/samples),quantile(0.99)(tx_bps_sum/samples),
-          countIf(rx_bps_sum/samples>=%(d80)s),countIf(rx_bps_sum/samples>=%(d90)s),countIf(rx_bps_sum/samples>=%(d95)s),
-          countIf(tx_bps_sum/samples>=%(u80)s),countIf(tx_bps_sum/samples>=%(u90)s),countIf(tx_bps_sum/samples>=%(u95)s),count()
-        FROM interface_stats_1m WHERE minute>=now()-INTERVAL %(minutes)s MINUTE AND interface=%(iface)s
-        """,parameters={"minutes":minutes,"iface":wan_name,"d80":dcap*.8,"d90":dcap*.9,"d95":dcap*.95,"u80":ucap*.8,"u90":ucap*.9,"u95":ucap*.95}).result_rows[0]
+        actual=ch.query(f"""
+          SELECT toUnixTimestamp(toStartOfInterval(minute,INTERVAL {bucket} SECOND)) t,
+                 sum(rx_bps_sum)/greatest(sum(samples),1),sum(tx_bps_sum)/greatest(sum(samples),1),
+                 min(rx_bps_sum/samples),max(rx_bps_sum/samples),min(tx_bps_sum/samples),max(tx_bps_sum/samples),
+                 quantile(.95)(rx_bps_sum/samples),quantile(.99)(rx_bps_sum/samples),
+                 quantile(.95)(tx_bps_sum/samples),quantile(.99)(tx_bps_sum/samples),
+                 countIf(rx_bps_sum/samples>=%(d80)s),countIf(rx_bps_sum/samples>=%(d90)s),countIf(rx_bps_sum/samples>=%(d95)s),
+                 countIf(tx_bps_sum/samples>=%(u80)s),countIf(tx_bps_sum/samples>=%(u90)s),countIf(tx_bps_sum/samples>=%(u95)s),count()
+          FROM interface_stats_1m WHERE minute>=now()-INTERVAL {minutes} MINUTE AND interface=%(iface)s
+          GROUP BY t ORDER BY t
+        """,parameters={"iface":wan,"d80":dcap*.8,"d90":dcap*.9,"d95":dcap*.95,"u80":ucap*.8,"u90":ucap*.9,"u95":ucap*.95}).result_rows
+        counters=(sum(float(r[1])*bucket/8 for r in actual),sum(float(r[2])*bucket/8 for r in actual))
 
-    # NetFlow = offered/requested traffic. Keep a fixed 5s window for comparable MIN/AVG/MAX.
-    offered_bucket = 5
-    offered_series = ch.query(f"""
-    SELECT
-      sumIf(Bytes*SamplingRate, InIfBoundary='external' AND OutIfBoundary='internal')*8/{offered_bucket} down_bps,
-      sumIf(Bytes*SamplingRate, InIfBoundary='internal' AND OutIfBoundary='external')*8/{offered_bucket} up_bps
-    FROM flows
-    PREWHERE TimeReceived >= now()-INTERVAL {minutes} MINUTE
-    GROUP BY toStartOfInterval(TimeReceived, INTERVAL {offered_bucket} SECOND)
+    # One NetFlow pass for series + flows. Long ranges are grouped directly to 10 minutes.
+    flow_series=ch.query(f"""
+      SELECT toUnixTimestamp(toStartOfInterval(TimeReceived,INTERVAL {bucket} SECOND)) t,
+        sumIf(Bytes*SamplingRate,InIfBoundary='external' AND OutIfBoundary='internal')*8/{bucket} d,
+        sumIf(Bytes*SamplingRate,InIfBoundary='internal' AND OutIfBoundary='external')*8/{bucket} u,
+        count()/{bucket} fps
+      FROM flows PREWHERE TimeReceived>=now()-INTERVAL {minutes} MINUTE GROUP BY t ORDER BY t
     """).result_rows
-    offered_down_values = [float(r[0]) for r in offered_series]
-    offered_up_values = [float(r[1]) for r in offered_series]
-
-    down_values = [float(r[1])*8/bucket for r in series]
-    up_values = [float(r[2])*8/bucket for r in series]
-    flow_values = [float(r[3])/bucket for r in series]
-    total_down = sum(int(r[1]) for r in series)
-    total_up = sum(int(r[2]) for r in series)
-
-    top = ch.query(f"""
-    SELECT
-      if(InIfBoundary='external' AND OutIfBoundary='internal', {v4("DstAddr")}, {v4("SrcAddr")}) ip,
-      sumIf(Bytes*SamplingRate, InIfBoundary='external' AND OutIfBoundary='internal') db,
-      sumIf(Bytes*SamplingRate, InIfBoundary='internal' AND OutIfBoundary='external') ub,
-      count() fc
-    FROM flows
-    PREWHERE TimeReceived >= now()-INTERVAL {minutes} MINUTE
-    WHERE (
-      (InIfBoundary='external' AND OutIfBoundary='internal' AND {df})
-      OR
-      (InIfBoundary='internal' AND OutIfBoundary='external' AND {sf})
-    )
-    GROUP BY ip
-    ORDER BY db+ub DESC LIMIT 100
+    fm={int(t):(float(d),float(u),float(fps)) for t,d,u,fps in flow_series}
+    av=[r for r in actual]
+    downs=[float(r[1]) for r in av]; ups=[float(r[2]) for r in av]
+    od=[float(r[1]) for r in flow_series]; ou=[float(r[2]) for r in flow_series]; fv=[float(r[3]) for r in flow_series]
+    def mmav(v): return {"min":int(min(v) if v else 0),"avg":int(sum(v)/len(v) if v else 0),"max":int(max(v) if v else 0)}
+    def pct(v,p):
+        if not v:return 0
+        z=sorted(v); return int(z[min(len(z)-1,int((len(z)-1)*p))])
+    # Threshold counts are summed from the same actual blocks (raw samples <=1h, 1m samples for long ranges).
+    samples=sum(int(r[17]) for r in av)
+    util=[sum(int(r[i]) for r in av) for i in range(11,17)] if av else [0]*6
+    top=ch.query(f"""
+      SELECT if(InIfBoundary='external' AND OutIfBoundary='internal',{v4("DstAddr")},{v4("SrcAddr")}) ip,
+        sumIf(Bytes*SamplingRate,InIfBoundary='external' AND OutIfBoundary='internal') db,
+        sumIf(Bytes*SamplingRate,InIfBoundary='internal' AND OutIfBoundary='external') ub,count() fc
+      FROM flows PREWHERE TimeReceived>=now()-INTERVAL {minutes} MINUTE
+      WHERE ((InIfBoundary='external' AND OutIfBoundary='internal' AND {df}) OR
+             (InIfBoundary='internal' AND OutIfBoundary='external' AND {sf}))
+      GROUP BY ip ORDER BY db+ub DESC LIMIT 100
     """).result_rows
-
-    sec = minutes * 60
-    def mmav(values):
-        return {"min": int(min(values) if values else 0),
-                "avg": int(sum(values)/len(values) if values else 0),
-                "max": int(max(values) if values else 0)}
-
-    result = {
-      "range": range, "download_bytes": int(wan_stats[6] or 0), "upload_bytes": int(wan_stats[7] or 0),
-      "download_bps": {"min": int(wan_stats[0] or 0), "avg": int(wan_stats[1] or 0), "max": int(wan_stats[2] or 0)},
-      "upload_bps": {"min": int(wan_stats[3] or 0), "avg": int(wan_stats[4] or 0), "max": int(wan_stats[5] or 0)},
-      "percentiles": {"download":{"p95":int(wan_extra[0] or 0),"p99":int(wan_extra[1] or 0)},"upload":{"p95":int(wan_extra[2] or 0),"p99":int(wan_extra[3] or 0)}},
-      "utilization": {"samples":int(wan_extra[10] or 0),"download":{"80":int(wan_extra[4] or 0),"90":int(wan_extra[5] or 0),"95":int(wan_extra[6] or 0)},"upload":{"80":int(wan_extra[7] or 0),"90":int(wan_extra[8] or 0),"95":int(wan_extra[9] or 0)}},
-      "offered_download_bps": mmav(offered_down_values),
-      "offered_upload_bps": mmav(offered_up_values),
-      "flows_per_second": mmav(flow_values),
-      "series": [{"t":int(t),"down":int(d*8/bucket),"up":int(u*8/bucket),"flows":round(float(fc)/bucket,2)}
-                 for t,d,u,fc in series],
-      "top": [{"ip":ip,"download_bytes":int(d),"upload_bytes":int(u),
-               "download_bps":int(d*8/sec),"upload_bps":int(u*8/sec),
-               "flows_per_second":round(fc/sec,2)} for ip,d,u,fc in top]
-    }
-    STATS_CACHE[range] = (now, result)
-    return result
-
+    sec=minutes*60
+    result={"range":range,"resolution_seconds":bucket,"download_bytes":int(counters[0] or 0),"upload_bytes":int(counters[1] or 0),
+      "download_bps":mmav(downs),"upload_bps":mmav(ups),
+      "percentiles":{"download":{"p95":pct(downs,.95),"p99":pct(downs,.99)},"upload":{"p95":pct(ups,.95),"p99":pct(ups,.99)}},
+      "utilization":{"samples":samples,"download":{"80":util[0],"90":util[1],"95":util[2]},"upload":{"80":util[3],"90":util[4],"95":util[5]}},
+      "offered_download_bps":mmav(od),"offered_upload_bps":mmav(ou),"flows_per_second":mmav(fv),
+      "series":[{"t":int(r[0]),"down":int(r[1]),"up":int(r[2]),"flows":round(fm.get(int(r[0]),(0,0,0))[2],2)} for r in av],
+      "top":[{"ip":ip,"download_bytes":int(d),"upload_bytes":int(u),"download_bps":int(d*8/sec),"upload_bps":int(u*8/sec),"flows_per_second":round(fc/sec,2)} for ip,d,u,fc in top]}
+    STATS_CACHE[range]=(now,result); return result
 
 @app.get("/api/customer/{ip}/profile")
 def customer_profile(ip:str, range:str=Query("24h")):
