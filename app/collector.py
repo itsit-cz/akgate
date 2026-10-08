@@ -88,6 +88,52 @@ SELECT toStartOfMinute(ts) minute, queue_id, sum(download_bps) download_bps_sum,
 FROM queue_stats GROUP BY minute,queue_id;
 """
 
+NETFLOW_ROLLUP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS netflow_stats_10m (
+    bucket DateTime('UTC'),
+    ip String,
+    download_bytes UInt64,
+    upload_bytes UInt64,
+    flows UInt64
+) ENGINE=SummingMergeTree
+PARTITION BY toYYYYMM(bucket)
+ORDER BY (bucket,ip)
+TTL bucket + INTERVAL 400 DAY;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS netflow_stats_10m_mv TO netflow_stats_10m AS
+SELECT toStartOfInterval(TimeReceived, INTERVAL 10 MINUTE) bucket,
+       if(InIfBoundary='external' AND OutIfBoundary='internal',
+          replaceRegexpOne(toString(DstAddr), '^::ffff:', ''),
+          replaceRegexpOne(toString(SrcAddr), '^::ffff:', '')) ip,
+       sumIf(Bytes*SamplingRate, InIfBoundary='external' AND OutIfBoundary='internal') download_bytes,
+       sumIf(Bytes*SamplingRate, InIfBoundary='internal' AND OutIfBoundary='external') upload_bytes,
+       count() flows
+FROM flows
+WHERE (InIfBoundary='external' AND OutIfBoundary='internal')
+   OR (InIfBoundary='internal' AND OutIfBoundary='external')
+GROUP BY bucket,ip;
+"""
+
+def ensure_netflow_rollups(ch):
+    for statement in [x.strip() for x in NETFLOW_ROLLUP_SCHEMA.split(";") if x.strip()]:
+        ch.command(statement)
+    # One-time backfill of history already present before the MV was created.
+    if ch.query("SELECT count() FROM netflow_stats_10m").result_rows[0][0] == 0:
+        ch.command("""
+          INSERT INTO netflow_stats_10m
+          SELECT toStartOfInterval(TimeReceived, INTERVAL 10 MINUTE) bucket,
+                 if(InIfBoundary='external' AND OutIfBoundary='internal',
+                    replaceRegexpOne(toString(DstAddr), '^::ffff:', ''),
+                    replaceRegexpOne(toString(SrcAddr), '^::ffff:', '')) ip,
+                 sumIf(Bytes*SamplingRate, InIfBoundary='external' AND OutIfBoundary='internal') download_bytes,
+                 sumIf(Bytes*SamplingRate, InIfBoundary='internal' AND OutIfBoundary='external') upload_bytes,
+                 count() flows
+          FROM flows
+          WHERE (InIfBoundary='external' AND OutIfBoundary='internal')
+             OR (InIfBoundary='internal' AND OutIfBoundary='external')
+          GROUP BY bucket,ip
+        """)
+
 def ensure_rollups(ch):
     for statement in [x.strip() for x in ROLLUP_SCHEMA.split(";") if x.strip()]:
         ch.command(statement)
@@ -182,6 +228,7 @@ def main():
     ch.command(SCHEMA)
     ch.command(WAN_SCHEMA)
     ensure_rollups(ch)
+    ensure_netflow_rollups(ch)
     ch.command("ALTER TABLE interface_stats MODIFY TTL ts + INTERVAL 14 DAY")
     ch.command("ALTER TABLE queue_stats MODIFY TTL ts + INTERVAL 14 DAY")
     ch.command("ALTER TABLE interface_stats ADD COLUMN IF NOT EXISTS rx_pps UInt64 DEFAULT 0")
