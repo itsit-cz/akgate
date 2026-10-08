@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.9.2")
+app = FastAPI(title="AKGATE Dashboard", version="0.9.3")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -243,7 +243,7 @@ def statistics(range: str = Query("1h")):
     minutes, _ = range_values(range)
     # Statistics resolution: <=1h closes into 1-minute blocks; >=6h into 10-minute blocks.
     # This keeps the response small and avoids expensive 5-second NetFlow grouping on long ranges.
-    bucket = 60 if minutes <= 60 else 600
+    bucket = 60 if minutes <= 60 else (600 if minutes < 1440 else 3600)
     now = time.monotonic()
     cached = STATS_CACHE.get(range)
     cache_ttl = 30 if minutes <= 60 else 300
@@ -283,14 +283,24 @@ def statistics(range: str = Query("1h")):
         """,parameters={"iface":wan,"d80":dcap*.8,"d90":dcap*.9,"d95":dcap*.95,"u80":ucap*.8,"u90":ucap*.9,"u95":ucap*.95}).result_rows
         counters=(sum(float(r[1])*bucket/8 for r in actual),sum(float(r[2])*bucket/8 for r in actual))
 
-    # One NetFlow pass for series + flows. Long ranges are grouped directly to 10 minutes.
-    flow_series=ch.query(f"""
-      SELECT toUnixTimestamp(toStartOfInterval(TimeReceived,INTERVAL {bucket} SECOND)) t,
-        sumIf(Bytes*SamplingRate,InIfBoundary='external' AND OutIfBoundary='internal')*8/{bucket} d,
-        sumIf(Bytes*SamplingRate,InIfBoundary='internal' AND OutIfBoundary='external')*8/{bucket} u,
-        count()/{bucket} fps
-      FROM flows PREWHERE TimeReceived>=now()-INTERVAL {minutes} MINUTE GROUP BY t ORDER BY t
-    """).result_rows
+    # NetFlow: short windows use raw flows; >=6h use persistent 10-minute rollup.
+    # For >=24h the response graph is hourly, while the source remains the lossless 10m sums.
+    if minutes <= 60:
+        flow_series=ch.query(f"""
+          SELECT toUnixTimestamp(toStartOfInterval(TimeReceived,INTERVAL {bucket} SECOND)) t,
+            sumIf(Bytes*SamplingRate,InIfBoundary='external' AND OutIfBoundary='internal')*8/{bucket} d,
+            sumIf(Bytes*SamplingRate,InIfBoundary='internal' AND OutIfBoundary='external')*8/{bucket} u,
+            count()/{bucket} fps
+          FROM flows PREWHERE TimeReceived>=now()-INTERVAL {minutes} MINUTE GROUP BY t ORDER BY t
+        """).result_rows
+    else:
+        flow_series=ch.query(f"""
+          SELECT toUnixTimestamp(toStartOfInterval(bucket,INTERVAL {bucket} SECOND)) t,
+                 sum(download_bytes)*8/{bucket} d,sum(upload_bytes)*8/{bucket} u,sum(flows)/{bucket} fps
+          FROM netflow_stats_10m
+          WHERE bucket>=now()-INTERVAL {minutes} MINUTE
+          GROUP BY t ORDER BY t
+        """).result_rows
     fm={int(t):(float(d),float(u),float(fps)) for t,d,u,fps in flow_series}
     av=[r for r in actual]
     downs=[float(r[1]) for r in av]; ups=[float(r[2]) for r in av]
@@ -302,15 +312,25 @@ def statistics(range: str = Query("1h")):
     # Threshold counts are summed from the same actual blocks (raw samples <=1h, 1m samples for long ranges).
     samples=sum(int(r[17]) for r in av)
     util=[sum(int(r[i]) for r in av) for i in (11,12,13,14,15,16)] if av else [0]*6
-    top=ch.query(f"""
-      SELECT if(InIfBoundary='external' AND OutIfBoundary='internal',{v4("DstAddr")},{v4("SrcAddr")}) ip,
-        sumIf(Bytes*SamplingRate,InIfBoundary='external' AND OutIfBoundary='internal') db,
-        sumIf(Bytes*SamplingRate,InIfBoundary='internal' AND OutIfBoundary='external') ub,count() fc
-      FROM flows PREWHERE TimeReceived>=now()-INTERVAL {minutes} MINUTE
-      WHERE ((InIfBoundary='external' AND OutIfBoundary='internal' AND {df}) OR
-             (InIfBoundary='internal' AND OutIfBoundary='external' AND {sf}))
-      GROUP BY ip ORDER BY db+ub DESC LIMIT 100
-    """).result_rows
+    if minutes <= 60:
+        top=ch.query(f"""
+          SELECT if(InIfBoundary='external' AND OutIfBoundary='internal',{v4("DstAddr")},{v4("SrcAddr")}) ip,
+            sumIf(Bytes*SamplingRate,InIfBoundary='external' AND OutIfBoundary='internal') db,
+            sumIf(Bytes*SamplingRate,InIfBoundary='internal' AND OutIfBoundary='external') ub,count() fc
+          FROM flows PREWHERE TimeReceived>=now()-INTERVAL {minutes} MINUTE
+          WHERE ((InIfBoundary='external' AND OutIfBoundary='internal' AND {df}) OR
+                 (InIfBoundary='internal' AND OutIfBoundary='external' AND {sf}))
+          GROUP BY ip ORDER BY db+ub DESC LIMIT 100
+        """).result_rows
+    else:
+        net_parts=[f"isIPAddressInRange(ip, '{n.with_prefixlen}')" for n in CUSTOMER_NETWORKS]
+        net_where="("+" OR ".join(net_parts)+")" if net_parts else "1"
+        top=ch.query(f"""
+          SELECT ip,sum(download_bytes) db,sum(upload_bytes) ub,sum(flows) fc
+          FROM netflow_stats_10m
+          WHERE bucket>=now()-INTERVAL {minutes} MINUTE AND {net_where}
+          GROUP BY ip ORDER BY db+ub DESC LIMIT 100
+        """).result_rows
     sec=minutes*60
     result={"range":range,"resolution_seconds":bucket,"download_bytes":int(counters[0] or 0),"upload_bytes":int(counters[1] or 0),
       "download_bps":mmav(downs),"upload_bps":mmav(ups),
