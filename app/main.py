@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from .db import client
 
-app = FastAPI(title="AKGATE Dashboard", version="0.9.1")
+app = FastAPI(title="AKGATE Dashboard", version="0.9.2")
 
 CUSTOMER_NETWORKS = [
     ip_network(x.strip()) for x in os.getenv("CUSTOMER_NETWORKS", "").split(",") if x.strip()
@@ -301,7 +301,7 @@ def statistics(range: str = Query("1h")):
         z=sorted(v); return int(z[min(len(z)-1,int((len(z)-1)*p))])
     # Threshold counts are summed from the same actual blocks (raw samples <=1h, 1m samples for long ranges).
     samples=sum(int(r[17]) for r in av)
-    util=[sum(int(r[i]) for r in av) for i in range(11,17)] if av else [0]*6
+    util=[sum(int(r[i]) for r in av) for i in (11,12,13,14,15,16)] if av else [0]*6
     top=ch.query(f"""
       SELECT if(InIfBoundary='external' AND OutIfBoundary='internal',{v4("DstAddr")},{v4("SrcAddr")}) ip,
         sumIf(Bytes*SamplingRate,InIfBoundary='external' AND OutIfBoundary='internal') db,
