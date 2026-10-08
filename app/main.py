@@ -331,6 +331,27 @@ def statistics(range: str = Query("1h")):
           WHERE bucket>=now()-INTERVAL {minutes} MINUTE AND {net_where}
           GROUP BY ip ORDER BY db+ub DESC LIMIT 100
         """).result_rows
+    # Per-customer ACTUAL traffic for rankings. Simple Queue is authoritative after shaping.
+    # Keep NetFlow 'top' below as offered/flow analytics; never use it as actual customer throughput.
+    if minutes <= 60:
+        top_actual=ch.query(f"""
+          SELECT queue_id,avg(download_bps) dbps,avg(upload_bps) ubps
+          FROM queue_stats
+          WHERE ts>=now()-INTERVAL {minutes} MINUTE
+          GROUP BY queue_id
+          ORDER BY dbps+ubps DESC LIMIT 100
+        """).result_rows
+    else:
+        top_actual=ch.query(f"""
+          SELECT queue_id,
+                 sum(download_bps_sum)/greatest(sum(samples),1) dbps,
+                 sum(upload_bps_sum)/greatest(sum(samples),1) ubps
+          FROM queue_stats_1m
+          WHERE minute>=now()-INTERVAL {minutes} MINUTE
+          GROUP BY queue_id
+          ORDER BY dbps+ubps DESC LIMIT 100
+        """).result_rows
+
     sec=minutes*60
     result={"range":range,"resolution_seconds":bucket,"download_bytes":int(counters[0] or 0),"upload_bytes":int(counters[1] or 0),
       "download_bps":mmav(downs),"upload_bps":mmav(ups),
@@ -338,6 +359,7 @@ def statistics(range: str = Query("1h")):
       "utilization":{"samples":samples,"download":{"80":util[0],"90":util[1],"95":util[2]},"upload":{"80":util[3],"90":util[4],"95":util[5]}},
       "offered_download_bps":mmav(od),"offered_upload_bps":mmav(ou),"flows_per_second":mmav(fv),
       "series":[{"t":int(r[0]),"down":int(r[1]),"up":int(r[2]),"flows":round(fm.get(int(r[0]),(0,0,0))[2],2)} for r in av],
+      "top_actual":[{"queue_id":qid,"download_bps":int(d),"upload_bps":int(u)} for qid,d,u in top_actual],
       "top":[{"ip":ip,"download_bytes":int(d),"upload_bytes":int(u),"download_bps":int(d*8/sec),"upload_bps":int(u*8/sec),"flows_per_second":round(fc/sec,2)} for ip,d,u,fc in top]}
     STATS_CACHE[range]=(now,result); return result
 
