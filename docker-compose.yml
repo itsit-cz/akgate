@@ -6,9 +6,30 @@ services:
     env_file:
       - .env
     ports:
-      - "${DASHBOARD_PORT:-8082}:8082"
+      - "127.0.0.1:${DASHBOARD_PORT:-8082}:8082"
     volumes:
       - ./data:/data
+    networks:
+      - akvorado
+
+
+  caddy:
+    image: caddy:2.10-alpine
+    container_name: akgate-caddy
+    restart: unless-stopped
+    depends_on:
+      - akgate-dashboard
+    environment:
+      - AKGATE_DOMAIN=${AKGATE_DOMAIN:-monitor.lukas.cloud}
+      - AKGATE_USER=${AKGATE_USER:-admin}
+      - AKGATE_PASSWORD_HASH=${AKGATE_PASSWORD_HASH}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
     networks:
       - akvorado
 
@@ -21,6 +42,10 @@ services:
       - .env
     networks:
       - akvorado
+
+volumes:
+  caddy_data:
+  caddy_config:
 
 networks:
   akvorado:
