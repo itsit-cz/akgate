@@ -1,0 +1,26 @@
+{
+    email {$ACME_EMAIL}
+}
+
+{$AKGATE_DOMAIN:monitor.lukas.cloud} {
+    encode zstd gzip
+
+    basic_auth {
+        {$AKGATE_USER:admin} {$AKGATE_PASSWORD_HASH}
+    }
+
+    reverse_proxy akgate-dashboard:8082
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "same-origin"
+        -Server
+    }
+
+    log {
+        output stdout
+        format console
+    }
+}
