@@ -583,26 +583,48 @@ def queue_live():
 
 @app.get("/api/traffic/history")
 def traffic_history(range: str = Query("1h")):
-    minutes,bucket=range_values(range); ch=client(); wan=os.getenv("MIKROTIK_WAN_INTERFACE","ether1")
-    if minutes <= 20160:
-        actual=ch.query(f"""
-          SELECT toUnixTimestamp(toStartOfInterval(ts, INTERVAL {bucket} SECOND)) t, avg(rx_bps), avg(tx_bps)
-          FROM interface_stats WHERE ts>=now()-INTERVAL {minutes} MINUTE AND interface=%(iface)s GROUP BY t ORDER BY t
-        """,parameters={"iface":wan}).result_rows
-    else:
-        actual=ch.query(f"""
+    minutes, bucket = range_values(range)
+    ch = client()
+    wan = os.getenv("MIKROTIK_WAN_INTERFACE", "ether1")
+    # Long time ranges use pre-aggregated tables; never scan raw flows for a month.
+    if minutes >= 1440:
+        actual = ch.query(f"""
           SELECT toUnixTimestamp(toStartOfInterval(minute, INTERVAL {bucket} SECOND)) t,
-                 sum(rx_bps_sum)/greatest(sum(samples),1),sum(tx_bps_sum)/greatest(sum(samples),1)
-          FROM interface_stats_1m WHERE minute>=now()-INTERVAL {minutes} MINUTE AND interface=%(iface)s GROUP BY t ORDER BY t
-        """,parameters={"iface":wan}).result_rows
-    offered=ch.query(f"""
-      SELECT toUnixTimestamp(toStartOfInterval(TimeReceived, INTERVAL {bucket} SECOND)) t,
-       sumIf(Bytes*SamplingRate,InIfBoundary='external' AND OutIfBoundary='internal')*8/{bucket},
-       sumIf(Bytes*SamplingRate,InIfBoundary='internal' AND OutIfBoundary='external')*8/{bucket}
-      FROM flows WHERE TimeReceived>=now()-INTERVAL {minutes} MINUTE GROUP BY t ORDER BY t
-    """).result_rows
-    om={int(t):(int(d),int(u)) for t,d,u in offered}
-    return [{"t":int(t),"down":int(d),"up":int(u),"offered_down":om.get(int(t),(0,0))[0],"offered_up":om.get(int(t),(0,0))[1]} for t,d,u in actual]
+                 sum(rx_bps_sum)/greatest(sum(samples),1),
+                 sum(tx_bps_sum)/greatest(sum(samples),1)
+          FROM interface_stats_1m
+          WHERE minute >= now()-INTERVAL {minutes} MINUTE AND interface=%(iface)s
+          GROUP BY t ORDER BY t
+        """, parameters={"iface": wan}).result_rows
+        offered = ch.query(f"""
+          SELECT toUnixTimestamp(toStartOfInterval(bucket, INTERVAL {bucket} SECOND)) t,
+                 sum(download_bytes)*8/{bucket},
+                 sum(upload_bytes)*8/{bucket}
+          FROM netflow_stats_10m
+          WHERE bucket >= now()-INTERVAL {minutes} MINUTE
+          GROUP BY t ORDER BY t
+        """).result_rows
+    else:
+        actual = ch.query(f"""
+          SELECT toUnixTimestamp(toStartOfInterval(ts, INTERVAL {bucket} SECOND)) t,
+                 avg(rx_bps), avg(tx_bps)
+          FROM interface_stats
+          WHERE ts >= now()-INTERVAL {minutes} MINUTE AND interface=%(iface)s
+          GROUP BY t ORDER BY t
+        """, parameters={"iface": wan}).result_rows
+        offered = ch.query(f"""
+          SELECT toUnixTimestamp(toStartOfInterval(TimeReceived, INTERVAL {bucket} SECOND)) t,
+                 sumIf(Bytes*SamplingRate,InIfBoundary='external' AND OutIfBoundary='internal')*8/{bucket},
+                 sumIf(Bytes*SamplingRate,InIfBoundary='internal' AND OutIfBoundary='external')*8/{bucket}
+          FROM flows
+          WHERE TimeReceived >= now()-INTERVAL {minutes} MINUTE
+          GROUP BY t ORDER BY t
+        """).result_rows
+    om = {int(t): (int(d), int(u)) for t, d, u in offered}
+    return [{"t": int(t), "down": int(d), "up": int(u),
+             "offered_down": om.get(int(t), (0, 0))[0],
+             "offered_up": om.get(int(t), (0, 0))[1]} for t, d, u in actual]
+
 
 @app.get("/api/interface/history")
 def interface_history(range: str = Query("1h")):
