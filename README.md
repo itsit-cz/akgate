@@ -52,3 +52,31 @@ The collector creates `queue_stats` automatically. Historical real-traffic graph
 Open `http://SERVER:8082`.
 
 > Never commit `.env` or credentials.
+
+
+## HTTPS + authentication
+
+Public access is served by Caddy at `https://monitor.lukas.cloud`. The dashboard itself is bound to localhost on port 8082 and is not exposed publicly.
+
+Add these values to `.env`:
+
+```text
+AKGATE_DOMAIN=monitor.lukas.cloud
+AKGATE_USER=admin
+AKGATE_PASSWORD_HASH=<Caddy bcrypt hash>
+ACME_EMAIL=<email for Let's Encrypt>
+```
+
+Generate a password hash without installing Caddy locally:
+
+```bash
+docker run --rm caddy:2.10-alpine caddy hash-password --plaintext 'CHANGE_ME'
+```
+
+Then start/rebuild the stack:
+
+```bash
+docker compose up -d --build
+```
+
+Ports 80 and 443 must reach this host for automatic certificate issuance and HTTPS redirects. Do not expose port 8082 publicly.
